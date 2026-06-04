@@ -41,6 +41,12 @@ async fn search_music(keyword: String) -> Result<SearchResponse, String> {
     Ok(engine.search(&kw).await)
 }
 
+#[tauri::command]
+async fn get_hot_keywords(limit: Option<usize>) -> Vec<HotItem> {
+    let engine = get_engine();
+    engine.hot_keywords(limit.unwrap_or(30)).await
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     println!("Starting Miku Tunes...");
@@ -71,6 +77,7 @@ pub fn run() {
             switch_source,
             score_source,
             search_music,
+            get_hot_keywords,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

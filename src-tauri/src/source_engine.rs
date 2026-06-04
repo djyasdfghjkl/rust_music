@@ -1,5 +1,6 @@
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -13,6 +14,15 @@ pub struct SourceInfo {
     pub file_name: String,
     pub score: i32,
     pub enabled: bool,
+}
+
+/// Parsed from each JS source file
+#[derive(Debug, Clone)]
+struct SourceMeta {
+    name: String,
+    api_url: String,
+    api_key: String,
+    platforms: Vec<String>,  // e.g. ["kw", "kg", "tx", "wy", "mg"]
 }
 
 // ─── Search result ───
@@ -34,9 +44,18 @@ pub struct SearchResponse {
     pub elapsed_ms: u64,
 }
 
+// ─── Hot keyword result ───
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotItem {
+    pub title: String,
+    pub source: String,
+    pub source_id: usize,
+}
+
 // ─── Engine state ───
 pub struct SourceEngine {
     sources: Mutex<Vec<SourceInfo>>,
+    meta_map: Mutex<HashMap<usize, SourceMeta>>,
     active_source: Mutex<usize>,
     http_client: reqwest::Client,
     source_dir: PathBuf,
@@ -45,13 +64,14 @@ pub struct SourceEngine {
 impl SourceEngine {
     pub fn new(source_dir: PathBuf) -> Self {
         let http_client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(8))
             .user_agent("MikuTunes/1.0")
             .build()
             .unwrap_or_default();
 
         let engine = Self {
             sources: Mutex::new(Vec::new()),
+            meta_map: Mutex::new(HashMap::new()),
             active_source: Mutex::new(0),
             http_client,
             source_dir,
@@ -60,9 +80,10 @@ impl SourceEngine {
         engine
     }
 
-    /// Scan 音源 directory for JS source files, parse names, randomize
+    /// Scan 音源 directory, parse each JS file for metadata
     pub fn scan_sources(&self) {
         let mut sources = Vec::new();
+        let mut meta_map = HashMap::new();
         let mut idx = 0usize;
 
         if let Ok(entries) = fs::read_dir(&self.source_dir) {
@@ -75,16 +96,19 @@ impl SourceEngine {
                         .unwrap_or("unknown")
                         .to_string();
 
-                    // Try to extract @name from JS file (first few lines)
-                    let name = extract_source_name(&path).unwrap_or_else(|| file_name.clone());
+                    // Parse JS file for metadata
+                    let (name, meta) = parse_source_file(&path, idx, &file_name);
 
                     sources.push(SourceInfo {
                         id: idx,
                         name,
-                        file_name,
                         score: 0,
                         enabled: true,
+                        file_name,
                     });
+                    if let Some(m) = meta {
+                        meta_map.insert(idx, m);
+                    }
                     idx += 1;
                 }
             }
@@ -93,8 +117,6 @@ impl SourceEngine {
         // Random initial sort
         let mut rng = rand::thread_rng();
         sources.shuffle(&mut rng);
-
-        // Assign new IDs after shuffle
         for (i, s) in sources.iter_mut().enumerate() {
             s.id = i;
         }
@@ -102,21 +124,21 @@ impl SourceEngine {
         if let Ok(mut current) = self.sources.lock() {
             *current = sources;
         }
+        if let Ok(mut map) = self.meta_map.lock() {
+            *map = meta_map;
+        }
     }
 
-    /// Get all sources with their current scores
     pub fn get_sources(&self) -> Vec<SourceInfo> {
         self.sources.lock().unwrap().clone()
     }
 
-    /// Get active source info
     pub fn get_active_source(&self) -> Option<SourceInfo> {
         let active_id = *self.active_source.lock().unwrap();
         let sources = self.sources.lock().unwrap();
         sources.iter().find(|s| s.id == active_id).cloned()
     }
 
-    /// Switch active source to a specific ID
     pub fn switch_source(&self, id: usize) -> bool {
         let sources = self.sources.lock().unwrap();
         if sources.iter().any(|s| s.id == id) {
@@ -127,70 +149,44 @@ impl SourceEngine {
         }
     }
 
-    /// Score a source: +1 if found, -1 if not found
     pub fn score_source(&self, source_id: usize, found: bool) {
         if let Ok(mut sources) = self.sources.lock() {
             if let Some(source) = sources.iter_mut().find(|s| s.id == source_id) {
-                if found {
-                    source.score += 1;
-                } else {
-                    source.score -= 1;
-                }
+                if found { source.score += 1; } else { source.score -= 1; }
             }
         }
     }
 
-    /// Search for music by keyword. Tries sources in score order.
+    /// Search music from ALL sources in parallel
     pub async fn search(&self, keyword: &str) -> SearchResponse {
         let start = Instant::now();
-
-        // Try all enabled sources in parallel, sorted by score (highest first)
         let sources = {
             let mut s = self.sources.lock().unwrap().clone();
             s.sort_by(|a, b| b.score.cmp(&a.score));
-            s.into_iter()
-                .filter(|s| s.enabled)
-                .collect::<Vec<_>>()
+            s.into_iter().filter(|s| s.enabled).collect::<Vec<_>>()
         };
-
-        if sources.is_empty() {
-            return SearchResponse {
-                results: vec![],
-                total: 0,
-                from_source: None,
-                elapsed_ms: start.elapsed().as_millis() as u64,
-            };
-        }
-
-        // Search all sources in parallel
+        let meta_map = self.meta_map.lock().unwrap().clone();
         let client = self.http_client.clone();
-        let keyword = keyword.to_string();
+        let kw = keyword.to_string();
 
-        let tasks: Vec<_> = sources
-            .into_iter()
-            .map(|source| {
-                let client = client.clone();
-                let kw = keyword.clone();
-                tokio::spawn(async move {
-                    let result = search_single_source(&client, &source, &kw).await;
-                    (source, result)
-                })
-            })
-            .collect();
+        let tasks: Vec<_> = sources.into_iter().filter_map(|source| {
+            let meta = meta_map.get(&source.id).cloned()?;
+            let client = client.clone();
+            let kw = kw.clone();
+            Some(tokio::spawn(async move {
+                let results = search_via_lxmusic(&client, &meta, &kw).await;
+                (source, results)
+            }))
+        }).collect();
 
         let mut all_results = Vec::new();
         let mut found_source: Option<String> = None;
 
         for task in tasks {
             if let Ok((source, results)) = task.await {
-                let found = !results.is_empty();
-
-                // Auto-score based on result
-                // (actual scoring via frontend +1/-1 is separate)
-                if found && found_source.is_none() {
+                if !results.is_empty() && found_source.is_none() {
                     found_source = Some(source.name.clone());
                 }
-
                 for mut r in results {
                     r.source_id = source.id;
                     r.score = source.score;
@@ -206,211 +202,268 @@ impl SourceEngine {
             elapsed_ms: start.elapsed().as_millis() as u64,
         }
     }
-}
 
-/// Try to search a single source using its API pattern
-async fn search_single_source(
-    client: &reqwest::Client,
-    source: &SourceInfo,
-    keyword: &str,
-) -> Vec<SongResult> {
-    let source_key = source.file_name.as_str();
+    /// Fetch hot search keywords from sources
+    pub async fn hot_keywords(&self, limit: usize) -> Vec<HotItem> {
+        let meta_map = self.meta_map.lock().unwrap().clone();
+        let client = self.http_client.clone();
 
-    match source_key {
-        "ixiaowo" | "xiaowo" => {
-            search_xiaowo(client, keyword).await
-        }
-        "monster" => {
-            search_monster(client, keyword).await
-        }
-        "sixyin-music-source-v1.2.0-encrypt" | "六音1.2.1版（最高支持无损音质）" | "六音自定义源" => {
-            search_sixyin(client, keyword).await
-        }
-        // Fallback: use a generic iTunes/audius search
-        _ => {
-            search_fallback(client, keyword).await
-        }
-    }
-}
+        let tasks: Vec<_> = meta_map.into_iter().map(|(id, meta)| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let items = hot_via_lxmusic(&client, &meta).await;
+                (id, meta.name, items)
+            })
+        }).collect();
 
-/// iTunes search API (good fallback for any source)
-async fn search_fallback(client: &reqwest::Client, keyword: &str) -> Vec<SongResult> {
-    let url = format!(
-        "https://itunes.apple.com/search?term={}&limit=10&media=music",
-        urlencoding(keyword)
-    );
-
-    match client.get(&url).send().await {
-        Ok(resp) => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    let mut results = Vec::new();
-                    if let Some(results_arr) = json["results"].as_array() {
-                        for item in results_arr {
-                            let title = item["trackName"].as_str().unwrap_or("").to_string();
-                            let artist = item["artistName"].as_str().unwrap_or("").to_string();
-                            if !title.is_empty() {
-                                results.push(SongResult {
-                                    title,
-                                    artist,
-                                    source: "iTunes".to_string(),
-                                    source_id: 0,
-                                    score: 0,
-                                });
-                            }
-                        }
-                    }
-                    results
+        let mut results = Vec::new();
+        for task in tasks {
+            if let Ok((id, name, items)) = task.await {
+                for item in items {
+                    results.push(HotItem {
+                        title: item,
+                        source: name.clone(),
+                        source_id: id,
+                    });
                 }
-                Err(_) => vec![],
             }
         }
-        Err(_) => vec![],
+
+        results.sort_by(|a, b| b.source.cmp(&a.source));
+        results.truncate(limit);
+        results
     }
 }
 
-/// Xiaowo / 小窝 API
-async fn search_xiaowo(client: &reqwest::Client, keyword: &str) -> Vec<SongResult> {
-    let url = format!("https://api.ixiaowo.com/api/search?keyword={}&type=song", urlencoding(keyword));
-    match client.get(&url).send().await {
-        Ok(resp) => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    let mut results = Vec::new();
-                    if let Some(data) = json["data"].as_array() {
-                        for item in data {
-                            results.push(SongResult {
-                                title: item["name"].as_str().unwrap_or("").to_string(),
-                                artist: item["artist"].as_str().unwrap_or("").to_string(),
-                                source: "小窝".to_string(),
-                                source_id: 0,
-                                score: 0,
-                            });
-                        }
-                    }
-                    results
-                }
-                Err(_) => vec![],
-            }
-        }
-        Err(_) => vec![],
-    }
-}
+// ─── Parse JS source file ───
 
-/// Monster API (monster)
-async fn search_monster(client: &reqwest::Client, keyword: &str) -> Vec<SongResult> {
-    let url = format!("https://api.monster.la/search?keyword={}&limit=10", urlencoding(keyword));
-    match client.get(&url).send().await {
-        Ok(resp) => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    let mut results = Vec::new();
-                    if let Some(songs) = json["songs"].as_array() {
-                        for item in songs {
-                            results.push(SongResult {
-                                title: item["title"].as_str().unwrap_or("").to_string(),
-                                artist: item["author"].as_str().unwrap_or("").to_string(),
-                                source: "Monster".to_string(),
-                                source_id: 0,
-                                score: 0,
-                            });
-                        }
-                    }
-                    results
-                }
-                Err(_) => vec![],
-            }
-        }
-        Err(_) => vec![],
-    }
-}
+fn parse_source_file(path: &std::path::Path, id: usize, file_name: &str) -> (String, Option<SourceMeta>) {
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return (file_name.to_string(), None),
+    };
 
-/// Sixyin API
-async fn search_sixyin(client: &reqwest::Client, keyword: &str) -> Vec<SongResult> {
-    let url = format!("https://api.6yin.com/search?keyword={}&type=song&limit=10", urlencoding(keyword));
-    match client.get(&url).send().await {
-        Ok(resp) => {
-            match resp.json::<serde_json::Value>().await {
-                Ok(json) => {
-                    let mut results = Vec::new();
-                    if let Some(data) = json["data"].as_array() {
-                        for item in data {
-                            results.push(SongResult {
-                                title: item["title"].as_str().unwrap_or("").to_string(),
-                                artist: item["singer"].as_str().unwrap_or("").to_string(),
-                                source: "六音".to_string(),
-                                source_id: 0,
-                                score: 0,
-                            });
-                        }
-                    }
-                    results
-                }
-                Err(_) => vec![],
-            }
-        }
-        Err(_) => vec![],
-    }
-}
+    let name = extract_source_name(&content).unwrap_or_else(|| file_name.to_string());
+    let api_url = extract_js_var(&content, "API_URL")
+        .map(|s| s.trim_matches('"').to_string());
+    let api_key = extract_js_var(&content, "API_KEY")
+        .map(|s| s.trim_matches('"').to_string());
+    let quality_str = extract_js_var(&content, "MUSIC_QUALITY");
 
-/// Simple URL encoding for query params
-fn urlencoding(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            ' ' => String::from("+"),
-            _ => {
-                let bytes = c.to_string().into_bytes();
-                bytes
-                    .iter()
-                    .map(|&b| format!("%{:02X}", b))
-                    .collect::<String>()
-            }
+    let platforms = quality_str
+        .and_then(|s| {
+            // Parse JSON object like {"kw":["128k"],"kg":["128k"],...}
+            serde_json::from_str::<HashMap<String, serde_json::Value>>(&s).ok()
+                .map(|map| map.keys().cloned().collect::<Vec<_>>())
         })
-        .collect()
+        .unwrap_or_else(|| vec!["kw".to_string()]); // default fallback
+
+    let meta = api_url.map(|url| SourceMeta {
+        name: name.clone(),
+        api_url: url,
+        api_key: api_key.unwrap_or_default(),
+        platforms,
+    });
+
+    (name, meta)
 }
 
-/// Extract @name from JS file header comment
-fn extract_source_name(path: &std::path::Path) -> Option<String> {
-    if let Ok(content) = fs::read_to_string(path) {
-        // Look for @name in comment header
-        for line in content.lines().take(30) {
-            let trimmed = line.trim();
-            if let Some(name_val) = trimmed.strip_prefix("* @name ") {
-                return Some(name_val.trim().to_string());
-            }
-            if let Some(name_val) = trimmed.strip_prefix(" * @name ") {
-                return Some(name_val.trim().to_string());
-            }
-            // Also check the source filename for patterns like "sixyin-music-source"
-            if trimmed.contains("@name") {
-                if let Some(idx) = trimmed.find("@name") {
-                    let rest = &trimmed[idx + 6..];
-                    if !rest.is_empty() {
-                        return Some(rest.trim().to_string());
-                    }
-                }
-            }
+/// Extract a JS variable value (const/let/var NAME = value)
+fn extract_js_var(content: &str, var_name: &str) -> Option<String> {
+    // Try patterns like:
+    // const API_URL = "value"
+    // const API_URL = 'value'
+    // const API_URL = `value`
+    // var API_URL = "value"
+    // let API_URL = "value"
+    // Also JSON.parse('{"key":...}') for MUSIC_QUALITY
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        // Skip comments
+        if trimmed.starts_with("//") || trimmed.starts_with("*") {
+            continue;
         }
-        // Try parsing name from first line: // @name xxx
-        if let Some(first_line) = content.lines().next() {
-            let fl = first_line.trim();
-            if fl.starts_with("// @name") || fl.starts_with("//@name") {
-                let rest = fl.trim_start_matches("//").trim_start_matches('@')
-                    .trim_start_matches("name").trim();
-                if !rest.is_empty() {
-                    return Some(rest.to_string());
-                }
-            }
-            // Also try: // name = "xxx"
-            if fl.contains("name") && fl.contains('"') {
-                if let Some(start) = fl.find('"') {
-                    if let Some(end) = fl[start + 1..].find('"') {
-                        return Some(fl[start + 1..start + 1 + end].to_string());
+
+        // Pattern: const/let/var API_URL = ...
+        let keyword = format!("{} =", var_name);
+        if let Some(idx) = trimmed.find(&keyword) {
+            let rest = trimmed[idx + keyword.len()..].trim();
+            // Handle JSON.parse('...')
+            if rest.starts_with("JSON.parse(") {
+                if let Some(start) = rest.find('\'') {
+                    if let Some(end) = rest[start + 1..].find('\'') {
+                        let inner = &rest[start + 1..start + 1 + end];
+                        // Unescape
+                        return Some(inner.replace("\\'", "'"));
                     }
                 }
+            }
+            // Handle quoted strings: "value" or 'value' or `value`
+            for quote in ['"', '\'', '`'].iter() {
+                if rest.starts_with(*quote) {
+                    let end = rest[1..].find(*quote)?;
+                    return Some(rest[1..1 + end].to_string());
+                }
+            }
+            // Handle JSON.parse(`...`)
+            if rest.contains("JSON.parse(`") {
+                if let Some(start) = rest.find('`') {
+                    if let Some(end) = rest[start + 1..].find('`') {
+                        return Some(rest[start + 1..start + 1 + end].to_string());
+                    }
+                }
+            }
+            // No quotes -> raw value
+            let val = rest.split(&[' ', ';', ',', '\n', '\r'][..]).next().unwrap_or(rest).to_string();
+            if !val.is_empty() && val != "=" {
+                return Some(val);
             }
         }
     }
     None
+}
+
+/// Extract @name from JS comment header
+fn extract_source_name(content: &str) -> Option<String> {
+    for line in content.lines().take(30) {
+        let trimmed = line.trim();
+        // @name xxx
+        if let Some(idx) = trimmed.find("@name") {
+            let rest = trimmed[idx + 5..].trim();
+            if !rest.is_empty() {
+                return Some(rest.trim_matches('*').trim().to_string());
+            }
+        }
+    }
+    None
+}
+
+// ─── LxMusic API calls ───
+
+/// Search via LxMusic format: POST {API_URL}/search
+async fn search_via_lxmusic(
+    client: &reqwest::Client,
+    meta: &SourceMeta,
+    keyword: &str,
+) -> Vec<SongResult> {
+    let mut results = Vec::new();
+
+    // Try each platform supported by this source
+    for platform in &meta.platforms {
+        let body = serde_json::json!({
+            "keyword": keyword,
+            "source": platform,
+            "limit": 5,
+            "key": meta.api_key,
+        });
+
+        // Try POST first, then GET
+        let resp = client
+            .post(format!("{}/search", meta.api_url.trim_end_matches('/')))
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+            .await;
+
+        if let Ok(r) = resp {
+            if let Ok(json) = r.json::<serde_json::Value>().await {
+                // LxMusic returns: { data: [{ name, singer, id, ... }] }
+                let songs = json.get("data")
+                    .or_else(|| json.get("songs"))
+                    .or_else(|| json.get("results"))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.clone())
+                    .unwrap_or_default();
+
+                for item in songs {
+                    let title = item.get("name").or_else(|| item.get("title"))
+                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let artist = item.get("singer").or_else(|| item.get("artist"))
+                        .or_else(|| item.get("author"))
+                        .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if !title.is_empty() {
+                        results.push(SongResult {
+                            title,
+                            artist,
+                            source: format!("{}-{}", meta.name, platform),
+                            source_id: 0,
+                            score: 0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    results
+}
+
+/// Fetch hot keywords via LxMusic format: POST {API_URL}/hot or GET {API_URL}/hot
+async fn hot_via_lxmusic(
+    client: &reqwest::Client,
+    meta: &SourceMeta,
+) -> Vec<String> {
+    let mut items = Vec::new();
+
+    for platform in &meta.platforms {
+        let base = meta.api_url.trim_end_matches('/');
+
+        // Try POST first
+        let body = serde_json::json!({
+            "source": platform,
+            "key": meta.api_key,
+        });
+        let resp = client
+            .post(format!("{}/hot", base))
+            .json(&body)
+            .timeout(std::time::Duration::from_secs(4))
+            .send()
+            .await;
+
+        if let Ok(r) = resp {
+            if let Ok(json) = r.json::<serde_json::Value>().await {
+                // Various response formats
+                let list = json.get("data")
+                    .or_else(|| json.get("hots"))
+                    .or_else(|| json.get("result"))
+                    .and_then(|v| v.as_array());
+                if let Some(arr) = list {
+                    for item in arr {
+                        let keyword = item.get("keyword").or_else(|| item.get("name"))
+                            .or_else(|| item.get("title"))
+                            .and_then(|v| v.as_str()).unwrap_or("");
+                        if !keyword.is_empty() {
+                            items.push(keyword.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        if items.len() >= 10 {
+            break;
+        }
+
+        // Try GET fallback
+        if items.is_empty() {
+            let url = format!("{}/hot?source={}", base, platform);
+            if let Ok(r) = client.get(&url).timeout(std::time::Duration::from_secs(4)).send().await {
+                if let Ok(json) = r.json::<serde_json::Value>().await {
+                    let list = json.get("data")
+                        .or_else(|| json.get("hots"))
+                        .and_then(|v| v.as_array());
+                    if let Some(arr) = list {
+                        for item in arr {
+                            let keyword = item.get("keyword").or_else(|| item.get("name"))
+                                .and_then(|v| v.as_str()).unwrap_or("");
+                            if !keyword.is_empty() {
+                                items.push(keyword.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    items
 }

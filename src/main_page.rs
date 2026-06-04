@@ -31,6 +31,13 @@ pub struct SearchResponse {
     pub elapsed_ms: u64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HotItem {
+    pub title: String,
+    pub source: String,
+    pub source_id: usize,
+}
+
 #[derive(Clone)]
 struct NavItem {
     icon: &'static str,
@@ -67,6 +74,8 @@ pub fn MainPage() -> impl IntoView {
     let search_query = RwSignal::new(String::new());
     let is_searching = RwSignal::new(false);
     let active_source = RwSignal::new(Option::<SourceInfo>::None);
+    let hot_keywords = RwSignal::new(Vec::<HotItem>::new());
+    let featured_songs = RwSignal::new(Vec::<SongResult>::new());
 
     // Player state
     let player_state = PlayerState::new();
@@ -89,12 +98,34 @@ pub fn MainPage() -> impl IntoView {
     };
     let _ = wasm_bindgen_futures::spawn_local(load_sources);
 
+    // Load hot keywords
+    let hk = hot_keywords.clone();
+    let fs = featured_songs.clone();
+    let load_hot = async move {
+        if let Ok(val) = invoke("get_hot_keywords", None).await {
+            if let Ok(items) = serde_wasm_bindgen::from_value::<Vec<HotItem>>(val) {
+                hk.set(items.clone());
+                // Auto-search first hot keyword for featured songs
+                if let Some(first) = items.first() {
+                    let args = js_sys::Object::new();
+                    js_sys::Reflect::set(&args, &JsValue::from_str("keyword"), &JsValue::from_str(&first.title)).ok();
+                    if let Ok(resp) = invoke("search_music", Some(&args)).await {
+                        if let Ok(resp) = serde_wasm_bindgen::from_value::<SearchResponse>(resp) {
+                            fs.set(resp.results.into_iter().take(12).collect());
+                        }
+                    }
+                }
+            }
+        }
+    };
+    let _ = wasm_bindgen_futures::spawn_local(load_hot);
+
     // Search handler
     let search_query_c = search_query.clone();
     let search_results_c = search_results.clone();
     let is_searching_c = is_searching.clone();
     let sources_c = sources.clone();
-    let do_search: Box<dyn Fn(String)> = Box::new(move |keyword: String| {
+    let do_search: Box<dyn Fn(String) + Send + Sync> = Box::new(move |keyword: String| {
         if keyword.trim().is_empty() {
             search_results_c.set(vec![]);
             return;
@@ -129,9 +160,11 @@ pub fn MainPage() -> impl IntoView {
                 search_query
                 is_searching
                 do_search
+                hot_keywords
+                featured_songs
                 player_state=player_state.clone()
             />
-            <RightPanel player_state=player_state.clone() />
+            <RightPanel sources active_source hot_keywords player_state=player_state.clone() />
             <PlayerBar state=player_state.clone() />
         </div>
 
@@ -272,84 +305,106 @@ fn MainContent(
     search_results: RwSignal<Vec<SongResult>>,
     search_query: RwSignal<String>,
     is_searching: RwSignal<bool>,
-    do_search: Box<dyn Fn(String)>,
+    do_search: Box<dyn Fn(String) + Send + Sync>,
+    hot_keywords: RwSignal<Vec<HotItem>>,
+    featured_songs: RwSignal<Vec<SongResult>>,
     player_state: PlayerState,
 ) -> impl IntoView {
+    let do_search = std::sync::Arc::new(do_search);
     let hour = js_sys::Date::new_0().get_hours();
     let greeting = if hour < 12 { "上午好" } else if hour < 18 { "下午好" } else { "晚上好" };
 
-    let on_search_input = move |ev: leptos::ev::Event| {
-        let input = event_target_value(&ev);
-        if input.len() >= 2 {
-            do_search(input);
+    let on_search_input = {
+        let do_search = do_search.clone();
+        move |ev: leptos::ev::Event| {
+            let input = event_target_value(&ev);
+            if input.len() >= 2 {
+                do_search(input);
+            }
         }
     };
 
-    // Fallback content (featured + artists)
+    // Fallback content (dynamic featured songs + hot keywords)
     let ps_fb = player_state.clone();
     let fallback_content = move || {
-        let items: Vec<(&str, &str, &str)> = vec![
-            ("千本桜", "初音ミク", "linear-gradient(135deg,#FF9EC5,#FF6B9D)"),
-            ("World is Mine", "初音ミク", "linear-gradient(135deg,#39C5BB,#2A9D95)"),
-            ("メルト", "初音ミク", "linear-gradient(135deg,#6C8BFF,#4A6BDF)"),
-            ("Tell Your World", "初音ミク", "linear-gradient(135deg,#8EDBD5,#39C5BB)"),
-            ("夜に駆ける", "YOASOBI", "linear-gradient(135deg,#E85555,#B83030)"),
-            ("Unravel", "TK", "linear-gradient(135deg,#FFB8D6,#FF9EC5)"),
-        ];
-        let artists: Vec<(&str, &str, &str)> = vec![
-            ("初音ミク", "#39C5BB", "M"),
-            ("Alan Walker", "#6C8BFF", "A"),
-            ("Taylor Swift", "#FF9EC5", "T"),
-            ("YOASOBI", "#8EDBD5", "Y"),
-            ("米津玄師", "#FFB8D6", "K"),
-            ("LiSA", "#E85555", "L"),
-        ];
+        let songs = featured_songs.get();
+        let hots = hot_keywords.get();
         let ps = ps_fb.clone();
-        view! {
-            <section class="section">
-                <div class="section-header">
-                    <h2 class="section-title">"精选歌曲"</h2>
-                    <a class="section-more" href="#">"查看全部 →"</a>
-                </div>
-                <div class="featured-grid">
-                    {items.into_iter().map(|(title, artist, color)| {
-                        let ps = ps.clone();
-                        let t = title.to_string();
-                        let a = artist.to_string();
-                        let cb = move |_| queue_song(&ps, &t, &a, "精选");
-                        view! {
-                            <div class="song-card" style=format!("background:{};", color)>
-                                <div class="song-card-overlay">
-                                    <button class="play-btn-small" on:click=cb>"▶"</button>
-                                </div>
-                                <div class="song-card-info">
-                                    <div class="song-card-title">{title}</div>
-                                    <div class="song-card-artist">{artist}</div>
-                                </div>
-                            </div>
-                        }
-                    }).collect_view()}
-                </div>
-            </section>
-            <section class="section">
-                <div class="section-header">
-                    <h2 class="section-title">"热门艺人"</h2>
-                    <a class="section-more" href="#">"查看全部 →"</a>
-                </div>
-                <div class="artist-scroll">
-                    {artists.into_iter().map(|(name, color, initial)| {
-                        view! {
-                            <div class="artist-item">
-                                <div class="artist-avatar" style=format!("background:{}", color)>
-                                    <span>{initial}</span>
-                                </div>
-                                <span class="artist-name">{name}</span>
-                            </div>
-                        }
-                    }).collect_view()}
-                </div>
-            </section>
+        let do_search = do_search.clone();
+
+        let mut children: Vec<leptos::prelude::AnyView> = Vec::new();
+
+        // Dynamic hot search section
+        if !hots.is_empty() {
+            let chips: Vec<leptos::prelude::AnyView> = hots.iter().take(16).enumerate().map(|(i, item)| {
+                let kw = item.title.clone();
+                let src = item.source.clone();
+                let do_search = do_search.clone();
+                let kw_handler = kw.clone();
+                let handler = move |_| {
+                    do_search(kw_handler.clone());
+                };
+                let badge = if i <= 2 {
+                    Some(view! { <sup>{i+1}</sup> }.into_any())
+                } else { None };
+                let colors = ["#FF9EC5","#FF6B9D","#39C5BB","#6C8BFF","#8EDBD5","#E85555","#FFB8D6"];
+                let color = colors[i % colors.len()];
+                view! {
+                    <button style=format!("border-color:{}", color) on:click=handler>
+                        {badge}
+                        <span>{kw}</span>
+                        <small>{src}</small>
+                    </button>
+                }.into_any()
+            }).collect();
+            children.push(view! {
+                <section class="section">
+                    <div class="section-header">
+                        <h2 class="section-title">"🔥 热门搜索"</h2>
+                    </div>
+                    <div class="hot-keywords-list">
+                        {chips}
+                    </div>
+                </section>
+            }.into_any());
         }
+
+        // Dynamic featured songs section
+        if !songs.is_empty() {
+            let cards: Vec<leptos::prelude::AnyView> = songs.iter().map(|song| {
+                let ps = ps.clone();
+                let t = song.title.clone();
+                let a = song.artist.clone();
+                let s = song.source.clone();
+                let cb = move |_| queue_song(&ps, &t, &a, &s);
+                let colors = ["linear-gradient(135deg,#FF9EC5,#FF6B9D)","linear-gradient(135deg,#39C5BB,#2A9D95)","linear-gradient(135deg,#6C8BFF,#4A6BDF)","linear-gradient(135deg,#8EDBD5,#39C5BB)","linear-gradient(135deg,#E85555,#B83030)","linear-gradient(135deg,#FFB8D6,#FF9EC5)"];
+                let color = colors[js_sys::Math::random() as usize % colors.len()];
+                view! {
+                    <div class="song-card" style=format!("background:{};", color)>
+                        <div class="song-card-overlay">
+                            <button class="play-btn-small" on:click=cb>"▶"</button>
+                        </div>
+                        <div class="song-card-info">
+                            <div class="song-card-title">{song.title.clone()}</div>
+                            <div class="song-card-artist">{song.artist.clone()}</div>
+                        </div>
+                    </div>
+                }.into_any()
+            }).collect();
+            children.push(view! {
+                <section class="section">
+                    <div class="section-header">
+                        <h2 class="section-title">"🎵 精选推荐"</h2>
+                        <a class="section-more" href="#">"更多 →"</a>
+                    </div>
+                    <div class="featured-grid">
+                        {cards}
+                    </div>
+                </section>
+            }.into_any());
+        }
+
+        children.into_any()
     };
 
     // Search results content
@@ -442,36 +497,49 @@ fn render_search_results(
 // RightPanel
 // ========================================================================
 #[component]
-fn RightPanel(player_state: PlayerState) -> impl IntoView {
-    let rec_items: Vec<(&str, &str, &str)> = vec![
-        ("夜に駆ける", "YOASOBI", "4:21"),
-        ("残酷な天使のテーゼ", "高橋洋子", "4:05"),
-        ("Unravel", "TK from 凛として時雨", "3:42"),
-        ("Gurenge", "LiSA", "3:58"),
-        ("KICK BACK", "米津玄師", "3:14"),
-    ];
-
-    let recent = vec!["千本桜", "World is Mine", "夜に駆ける", "メルト"];
-
-    let ps = player_state.clone();
+fn RightPanel(
+    sources: RwSignal<Vec<SourceInfo>>,
+    active_source: RwSignal<Option<SourceInfo>>,
+    hot_keywords: RwSignal<Vec<HotItem>>,
+    player_state: PlayerState,
+) -> impl IntoView {
+    let ps_rc = player_state.clone();
+    let total_score = Signal::derive(move || {
+        sources.get().iter().map(|s| s.score).sum::<i32>()
+    });
+    let queue_tracks = move || {
+        let q = player_state.queue.get();
+        q.iter().rev().take(10).map(|track| {
+            let title = track.title.clone();
+            view! {
+                <div class="recent-item">
+                    <span class="recent-icon">"♪"</span>
+                    <span class="recent-name">{title}</span>
+                </div>
+            }
+        }).collect_view()
+    };
     view! {
         <aside class="right-panel">
             <section class="panel-section">
-                <h3 class="panel-title">"推荐歌曲"</h3>
+                <h3 class="panel-title">"🔥 热搜推荐"</h3>
                 <div class="rec-list">
-                    {rec_items.iter().map(|(title, artist, duration)| {
-                        let t = title.to_string();
-                        let a = artist.to_string();
+                    {move || hot_keywords.get().into_iter().take(10).map(|item| {
+                        let t = item.title.clone();
+                        let s = item.source.clone();
                         let ps = player_state.clone();
-                        let cb = move |_| queue_song(&ps, &t, &a, "推荐");
+                        let a = String::new();
+                        let cb = move |_| queue_song(&ps, &t, &a, &s);
+                        let title_display = item.title.clone();
+                        let source_display = item.source.clone();
                         view! {
                             <div class="rec-item">
                                 <div class="rec-info">
-                                    <span class="rec-title">{*title}</span>
-                                    <span class="rec-artist">{*artist}</span>
+                                    <span class="rec-title">{title_display}</span>
+                                    <span class="rec-artist">{source_display}</span>
                                 </div>
-                                <span class="rec-duration">{*duration}</span>
-                                <button class="rec-play" on:click=cb>"▶"</button>
+                                <span class="rec-duration">"热搜"</span>
+                                <button class="rec-play" on:click=cb>"🔍"</button>
                             </div>
                         }
                     }).collect_view()}
@@ -479,43 +547,33 @@ fn RightPanel(player_state: PlayerState) -> impl IntoView {
             </section>
 
             <section class="panel-section">
-                <h3 class="panel-title">"即将演出"</h3>
+                <h3 class="panel-title">"📊 音源状态"</h3>
                 <div class="shows-list">
                     <div class="show-card">
                         <div class="show-info">
-                            <span class="show-name">"Miku Expo 2025"</span>
-                            <span class="show-time">"2025.12.20"</span>
+                            <span class="show-name">"活跃音源"</span>
+                            <span class="show-time">{move || format!("{} 个", sources.get().len())}</span>
                         </div>
-                        <button class="remind-btn">"提醒"</button>
                     </div>
                     <div class="show-card">
                         <div class="show-info">
-                            <span class="show-name">"Magical Mirai"</span>
-                            <span class="show-time">"2025.08.30"</span>
+                            <span class="show-name">"总积分"</span>
+                            <span class="show-time">{move || format!("{}", total_score.get())}</span>
                         </div>
-                        <button class="remind-btn">"提醒"</button>
                     </div>
                     <div class="show-card">
                         <div class="show-info">
-                            <span class="show-name">"VOCALOID Night"</span>
-                            <span class="show-time">"每周五 21:00"</span>
+                            <span class="show-name">"当前音源"</span>
+                            <span class="show-time">{move || active_source.get().map(|a| a.name).unwrap_or_default()}</span>
                         </div>
-                        <button class="remind-btn">"提醒"</button>
                     </div>
                 </div>
             </section>
 
             <section class="panel-section">
-                <h3 class="panel-title">"最近播放"</h3>
+                <h3 class="panel-title">"🎶 播放队列"</h3>
                 <div class="recent-list">
-                    {recent.iter().map(|&name| {
-                        view! {
-                            <div class="recent-item">
-                                <span class="recent-icon">"♪"</span>
-                                <span class="recent-name">{name}</span>
-                            </div>
-                        }
-                    }).collect_view()}
+                    {queue_tracks()}
                 </div>
             </section>
         </aside>
