@@ -1,6 +1,41 @@
+# Build outputs
 /dist/
 /target/
-/Cargo.lock
-/node_modules/
+/target-current/
+/target-package/
+/ui/dist/
+
+# Packaged apps and installers
+/win/
+/mac/
 *.exe
+*.msi
+*.msix
+*.appx
+*.nsis
+*.zip
+
+# Node dependencies
+/node_modules/
+
+# Local tool/runtime state
+/.mcp/
+.codex/
+.agents/
+
+# Local notes and pasted scratch docs
 /md/*.md
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.log
+.DS_Store
+Thumbs.db
+
+# Local environment
+.env
+.env.local

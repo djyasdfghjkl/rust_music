@@ -4,6 +4,7 @@ mod home;
 mod main_page;
 mod player;
 mod tauri_utils;
+mod types;
 
 use app::*;
 use leptos::prelude::*;

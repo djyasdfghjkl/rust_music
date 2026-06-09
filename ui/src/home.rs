@@ -19,6 +19,7 @@ struct Particle {
 
 /// 欢迎页组件 - Canvas 手写动画 + 开始使用按钮
 #[component]
+#[allow(dead_code)]
 pub fn HomePage(on_start: impl Fn() + 'static) -> impl IntoView {
     let canvas_ref = NodeRef::<leptos::html::Canvas>::new();
     let description = AppConfig::NAME_ZH;
@@ -75,13 +76,7 @@ pub fn HomePage(on_start: impl Fn() + 'static) -> impl IntoView {
     }
 }
 
-fn run_animation(
-    ctx: CanvasRenderingContext2d,
-    text: &str,
-    w: f64,
-    h: f64,
-    dpr: f64,
-) {
+fn run_animation(ctx: CanvasRenderingContext2d, text: &str, w: f64, h: f64, dpr: f64) {
     let font_size = 72.0;
     ctx.set_font(&format!(
         "bold {}px 'Inter','PingFang SC','Microsoft YaHei',sans-serif",
@@ -122,8 +117,7 @@ fn run_animation(
         ctx.save();
         ctx.scale(dpr, dpr).ok();
 
-        let gradient = ctx
-            .create_linear_gradient(start_x, 0.0, start_x + text_width, 0.0);
+        let gradient = ctx.create_linear_gradient(start_x, 0.0, start_x + text_width, 0.0);
 
         gradient.add_color_stop(0.0, "#39C5BB").ok();
         gradient.add_color_stop(0.5, "#6C8BFF").ok();
@@ -141,7 +135,12 @@ fn run_animation(
 
         ctx.save();
         ctx.begin_path();
-        ctx.rect(start_x - 10.0, cy - font_size * 0.8, current_w + 20.0, font_size * 2.0);
+        ctx.rect(
+            start_x - 10.0,
+            cy - font_size * 0.8,
+            current_w + 20.0,
+            font_size * 2.0,
+        );
         ctx.clip();
 
         ctx.set_shadow_color("rgba(57, 197, 187, 0.3)");
@@ -160,17 +159,21 @@ fn run_animation(
             let tip_grad = ctx
                 .create_radial_gradient(write_x, cy, 0.0, write_x, cy, 24.0)
                 .unwrap();
-            tip_grad.add_color_stop(0.0, "rgba(108, 139, 255, 0.9)").ok();
+            tip_grad
+                .add_color_stop(0.0, "rgba(108, 139, 255, 0.9)")
+                .ok();
             tip_grad.add_color_stop(0.5, "rgba(57, 197, 187, 0.4)").ok();
             tip_grad.add_color_stop(1.0, "rgba(57, 197, 187, 0)").ok();
             ctx.set_fill_style_canvas_gradient(&tip_grad);
             ctx.begin_path();
-            ctx.arc(write_x, cy, 24.0, 0.0, std::f64::consts::PI * 2.0).ok();
+            ctx.arc(write_x, cy, 24.0, 0.0, std::f64::consts::PI * 2.0)
+                .ok();
             ctx.fill();
 
             ctx.set_fill_style_str("rgba(255, 255, 255, 0.9)");
             ctx.begin_path();
-            ctx.arc(write_x, cy, 4.0, 0.0, std::f64::consts::PI * 2.0).ok();
+            ctx.arc(write_x, cy, 4.0, 0.0, std::f64::consts::PI * 2.0)
+                .ok();
             ctx.fill();
         }
 
@@ -182,9 +185,12 @@ fn run_animation(
                     let angle = js_sys::Math::random() * std::f64::consts::PI * 2.0;
                     let speed = 0.5 + js_sys::Math::random() * 1.5;
                     ps.push(Particle {
-                        x: write_x, y: cy,
-                        vx: angle.cos() * speed, vy: angle.sin() * speed,
-                        life: 1.0, max_life: 0.6 + js_sys::Math::random() * 0.8,
+                        x: write_x,
+                        y: cy,
+                        vx: angle.cos() * speed,
+                        vy: angle.sin() * speed,
+                        life: 1.0,
+                        max_life: 0.6 + js_sys::Math::random() * 0.8,
                         size: 1.5 + js_sys::Math::random() * 3.0,
                         hue: 170.0 + js_sys::Math::random() * 110.0,
                     });
@@ -197,8 +203,10 @@ fn run_animation(
                     ps.push(Particle {
                         x: cx + (js_sys::Math::random() - 0.5) * text_width * 0.8,
                         y: cy + (js_sys::Math::random() - 0.5) * 40.0,
-                        vx: angle.cos() * speed, vy: angle.sin() * speed - 0.5,
-                        life: 1.0, max_life: 0.8 + js_sys::Math::random() * 1.2,
+                        vx: angle.cos() * speed,
+                        vy: angle.sin() * speed - 0.5,
+                        life: 1.0,
+                        max_life: 0.8 + js_sys::Math::random() * 1.2,
                         size: 1.0 + js_sys::Math::random() * 2.0,
                         hue: 180.0 + js_sys::Math::random() * 150.0,
                     });
@@ -206,12 +214,15 @@ fn run_animation(
             }
             ps.retain(|p| p.life > 0.0);
             for p in ps.iter_mut() {
-                p.x += p.vx; p.y += p.vy; p.vy += 0.02;
+                p.x += p.vx;
+                p.y += p.vy;
+                p.vy += 0.02;
                 p.life -= 1.0 / 60.0 / p.max_life;
                 let alpha = p.life.max(0.0);
                 ctx.set_fill_style_str(&format!("hsla({}, 80%, 70%, {})", p.hue as i32, alpha));
                 ctx.begin_path();
-                ctx.arc(p.x, p.y, p.size * alpha, 0.0, std::f64::consts::PI * 2.0).ok();
+                ctx.arc(p.x, p.y, p.size * alpha, 0.0, std::f64::consts::PI * 2.0)
+                    .ok();
                 ctx.fill();
             }
         }

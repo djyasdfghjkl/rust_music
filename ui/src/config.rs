@@ -1,6 +1,7 @@
 /// Miku Tunes 应用配置
 pub struct AppConfig;
 
+#[allow(dead_code)]
 impl AppConfig {
     /// 应用名称
     pub const NAME: &'static str = "Miku Tunes";
