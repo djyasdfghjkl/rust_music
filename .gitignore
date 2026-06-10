@@ -4,7 +4,8 @@
 /target-current/
 /target-package/
 /ui/dist/
-
+/target-win-build/
+/download/
 # Packaged apps and installers
 /win/
 /mac/

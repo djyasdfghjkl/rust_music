@@ -23,6 +23,18 @@ enum Page {
     Settings,
 }
 
+fn page_icon_class(page: &Page) -> &'static str {
+    match page {
+        Page::Home => "icon-shouye1",
+        Page::Rankings => "icon-paihangbang",
+        Page::Playlists => "icon-gedan",
+        Page::Search => "icon-search",
+        Page::Favorites => "icon-shoucang",
+        Page::Parser => "icon-yunjiexi",
+        Page::Settings => "icon-shezhi",
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SearchSortMode {
     Source,
@@ -30,6 +42,43 @@ enum SearchSortMode {
     Match,
     Duration,
     Title,
+}
+
+fn quality_rank(song: &SongResult) -> i32 {
+    match song.platform.as_str() {
+        "kw" | "kg" | "tx" => 3,
+        "wy" | "mg" => 2,
+        _ => 1,
+    }
+}
+
+fn search_result_key(song: &SongResult) -> String {
+    if song.id.trim().is_empty() {
+        format!(
+            "fallback::{}::{}::{}",
+            song.title, song.artist, song.platform
+        )
+    } else {
+        format!("{}::{}::{}", song.source_id, song.platform, song.id)
+    }
+}
+
+fn merge_search_results(current: &mut Vec<SongResult>, incoming: Vec<SongResult>) {
+    let mut seen = current
+        .iter()
+        .map(search_result_key)
+        .collect::<std::collections::HashSet<_>>();
+    for song in incoming {
+        if seen.insert(search_result_key(&song)) {
+            current.push(song);
+        }
+    }
+}
+
+fn dedupe_search_results(results: Vec<SongResult>) -> Vec<SongResult> {
+    let mut out = Vec::new();
+    merge_search_results(&mut out, results);
+    out
 }
 
 impl SearchSortMode {
@@ -59,6 +108,7 @@ pub fn MainPage() -> impl IntoView {
     let selected_playlist = RwSignal::new(Option::<PlaylistInfo>::None);
     let loading_home = RwSignal::new(true);
     let loading_detail = RwSignal::new(false);
+    let init_error = RwSignal::new(Option::<String>::None);
 
     let search_query = RwSignal::new(String::new());
     let search_results = RwSignal::new(Vec::<SongResult>::new());
@@ -73,6 +123,9 @@ pub fn MainPage() -> impl IntoView {
     let shared_loading = RwSignal::new(false);
     let shared_error = RwSignal::new(Option::<String>::None);
     let shared_url = RwSignal::new(String::new());
+    let favorite_playlist_detail = RwSignal::new(Option::<SharedPlaylist>::None);
+    let favorite_playlist_loading = RwSignal::new(false);
+    let favorite_playlist_error = RwSignal::new(Option::<String>::None);
 
     let show_source_menu = RwSignal::new(false);
     let show_source_help = RwSignal::new(false);
@@ -144,6 +197,22 @@ pub fn MainPage() -> impl IntoView {
             })
         };
 
+    let add_favorite_song: std::sync::Arc<dyn Fn(FavoriteSong) + Send + Sync> = {
+        let favorites = favorites.clone();
+        std::sync::Arc::new(move |song| {
+            let mut data = favorites.get_untracked();
+            if !data
+                .songs
+                .iter()
+                .any(|item| same_song_favorite(item, &song))
+            {
+                data.songs.insert(0, song);
+                save_favorites(&data);
+                favorites.set(data);
+            }
+        })
+    };
+
     let on_play_song: std::sync::Arc<dyn Fn(String, String, String, usize, String) + Send + Sync> = {
         let state = player_state.clone();
         std::sync::Arc::new(move |title, artist, song_id, source_id, platform| {
@@ -170,6 +239,18 @@ pub fn MainPage() -> impl IntoView {
     let on_play_search_result: std::sync::Arc<dyn Fn(Vec<SongResult>, usize) + Send + Sync> = {
         let state = player_state.clone();
         std::sync::Arc::new(move |songs, index| replace_queue_and_play(state.clone(), songs, index))
+    };
+
+    let on_append_search_results: std::sync::Arc<dyn Fn(Vec<SongResult>) + Send + Sync> = {
+        let state = player_state.clone();
+        std::sync::Arc::new(move |songs| append_search_results_to_queue(state.clone(), songs))
+    };
+
+    let on_play_song_list: std::sync::Arc<dyn Fn(Vec<SongDetail>, usize) + Send + Sync> = {
+        let state = player_state.clone();
+        std::sync::Arc::new(move |songs, index| {
+            replace_queue_with_song_details_and_play(state.clone(), songs, index)
+        })
     };
 
     let do_search: std::sync::Arc<dyn Fn(String) + Send + Sync> = {
@@ -316,6 +397,80 @@ pub fn MainPage() -> impl IntoView {
         })
     };
 
+    let on_select_favorite_playlist: std::sync::Arc<dyn Fn(FavoritePlaylist) + Send + Sync> = {
+        let favorite_playlist_detail = favorite_playlist_detail.clone();
+        let favorite_playlist_loading = favorite_playlist_loading.clone();
+        let favorite_playlist_error = favorite_playlist_error.clone();
+        std::sync::Arc::new(move |playlist| {
+            favorite_playlist_detail.set(None);
+            favorite_playlist_error.set(None);
+            favorite_playlist_loading.set(true);
+            let favorite_playlist_detail = favorite_playlist_detail.clone();
+            let favorite_playlist_loading = favorite_playlist_loading.clone();
+            let favorite_playlist_error = favorite_playlist_error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Some(url) = playlist.external_url.clone() {
+                    let args = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(
+                        &args,
+                        &JsValue::from_str("url"),
+                        &JsValue::from_str(&url),
+                    );
+                    match invoke("parse_kugou_playlist", Some(&args)).await {
+                        Ok(value) => {
+                            match serde_wasm_bindgen::from_value::<SharedPlaylist>(value) {
+                                Ok(shared) => favorite_playlist_detail.set(Some(shared)),
+                                Err(err) => favorite_playlist_error
+                                    .set(Some(format!("歌单数据解析失败: {err}"))),
+                            }
+                        }
+                        Err(err) => favorite_playlist_error.set(Some(
+                            err.as_string()
+                                .unwrap_or_else(|| "歌单解析失败".to_string()),
+                        )),
+                    }
+                } else {
+                    let args = js_sys::Object::new();
+                    let _ = js_sys::Reflect::set(
+                        &args,
+                        &JsValue::from_str("sourceId"),
+                        &JsValue::from_f64(playlist.source_id as f64),
+                    );
+                    let _ = js_sys::Reflect::set(
+                        &args,
+                        &JsValue::from_str("playlistId"),
+                        &JsValue::from_str(&playlist.id),
+                    );
+                    match invoke("get_playlist_songs", Some(&args)).await {
+                        Ok(value) => match serde_wasm_bindgen::from_value::<Vec<SongDetail>>(value)
+                        {
+                            Ok(songs) => favorite_playlist_detail.set(Some(SharedPlaylist {
+                                playlist: PlaylistInfo {
+                                    id: playlist.id.clone(),
+                                    name: playlist.name.clone(),
+                                    cover: playlist.cover.clone(),
+                                    song_count: Some(songs.len()),
+                                    source_id: playlist.source_id,
+                                    source_name: playlist.source_name.clone(),
+                                },
+                                songs,
+                                external_url: String::new(),
+                                note: None,
+                            })),
+                            Err(err) => favorite_playlist_error
+                                .set(Some(format!("歌单数据解析失败: {err}"))),
+                        },
+                        Err(err) => favorite_playlist_error.set(Some(
+                            err.as_string()
+                                .unwrap_or_else(|| "歌单加载失败".to_string()),
+                        )),
+                    }
+                }
+                favorite_playlist_loading.set(false);
+            });
+        })
+    };
+
     let move_source_action: std::sync::Arc<dyn Fn(usize, String) + Send + Sync> = {
         let sources = sources.clone();
         let active_source = active_source.clone();
@@ -385,43 +540,77 @@ pub fn MainPage() -> impl IntoView {
     {
         let sources = sources.clone();
         let active_source = active_source.clone();
-        let hot_keywords = hot_keywords.clone();
-        let rankings = rankings.clone();
-        let playlists = playlists.clone();
         let loading_home = loading_home.clone();
+        let init_error = init_error.clone();
         wasm_bindgen_futures::spawn_local(async move {
-            if let Ok(value) = invoke("get_sources", None).await {
-                if let Ok(list) = serde_wasm_bindgen::from_value::<Vec<SourceInfo>>(value) {
-                    sources.set(list);
-                    if let Ok(value) = invoke("get_active_source", None).await {
-                        if let Ok(active) =
-                            serde_wasm_bindgen::from_value::<Option<SourceInfo>>(value)
-                        {
-                            active_source.set(active);
+            match invoke("get_sources", None).await {
+                Ok(value) => match serde_wasm_bindgen::from_value::<Vec<SourceInfo>>(value) {
+                    Ok(list) => {
+                        let n = list.len();
+                        sources.set(list);
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "[init] get_sources OK: {n} entries"
+                        )));
+                        if n == 0 {
+                            init_error.set(Some("音源列表为空，请检查 EXE 是否完整".to_string()));
+                        }
+                        if let Ok(value) = invoke("get_active_source", None).await {
+                            if let Ok(active) =
+                                serde_wasm_bindgen::from_value::<Option<SourceInfo>>(value)
+                            {
+                                active_source.set(active);
+                            }
                         }
                     }
-                    if let Ok(value) = invoke("get_hot_keywords", None).await {
-                        if let Ok(items) = serde_wasm_bindgen::from_value::<Vec<HotItem>>(value) {
-                            hot_keywords.set(items);
-                        }
+                    Err(e) => {
+                        let msg = format!("音源数据解析失败: {e:?}");
+                        web_sys::console::error_1(&JsValue::from_str(&msg));
+                        init_error.set(Some(msg));
                     }
-                    if let Ok(value) = invoke("get_all_rankings", None).await {
-                        if let Ok(items) =
-                            serde_wasm_bindgen::from_value::<Vec<RankingCategory>>(value)
-                        {
-                            rankings.set(items);
-                        }
-                    }
-                    if let Ok(value) = invoke("get_all_playlists", None).await {
-                        if let Ok(items) =
-                            serde_wasm_bindgen::from_value::<Vec<PlaylistInfo>>(value)
-                        {
-                            playlists.set(items);
-                        }
-                    }
+                },
+                Err(e) => {
+                    let msg = format!(
+                        "获取音源失败: {}",
+                        e.as_string().unwrap_or_else(|| "未知错误".to_string())
+                    );
+                    web_sys::console::error_1(&JsValue::from_str(&msg));
+                    init_error.set(Some(msg));
                 }
             }
             loading_home.set(false);
+        });
+    }
+
+    {
+        let hot_keywords = hot_keywords.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(value) = invoke("get_hot_keywords", None).await {
+                if let Ok(items) = serde_wasm_bindgen::from_value::<Vec<HotItem>>(value) {
+                    hot_keywords.set(items);
+                }
+            }
+        });
+    }
+
+    {
+        let rankings = rankings.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(value) = invoke("get_all_rankings", None).await {
+                if let Ok(items) = serde_wasm_bindgen::from_value::<Vec<RankingCategory>>(value) {
+                    rankings.set(items);
+                }
+            }
+        });
+    }
+
+    {
+        let playlists = playlists.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(value) = invoke("get_all_playlists", None).await {
+                if let Ok(items) = serde_wasm_bindgen::from_value::<Vec<PlaylistInfo>>(value) {
+                    playlists.set(items);
+                }
+            }
         });
     }
 
@@ -507,11 +696,17 @@ pub fn MainPage() -> impl IntoView {
     let content_do_search = navigate_search.clone();
     let content_schedule_search = schedule_search.clone();
     let content_play_song = on_play_song.clone();
+    let content_play_song_list = on_play_song_list.clone();
     let content_play_search = on_play_search_result.clone();
+    let content_append_search = on_append_search_results.clone();
     let content_toggle_song = toggle_favorite_song.clone();
+    let content_add_song = add_favorite_song.clone();
     let content_toggle_playlist = toggle_favorite_playlist.clone();
     let content_select_ranking = on_select_ranking.clone();
     let content_select_playlist = on_select_playlist.clone();
+    let content_select_favorite_playlist = on_select_favorite_playlist.clone();
+    let content_move_source = move_source_action.clone();
+    let content_set_source_enabled = set_source_enabled.clone();
 
     view! {
         <div class="app-layout" on:contextmenu=move |ev| ev.prevent_default()>
@@ -535,6 +730,7 @@ pub fn MainPage() -> impl IntoView {
                             rankings=rankings.get()
                             playlists=playlists.get()
                             loading=loading_home.get()
+                            init_error=init_error.get()
                             sources=sources.get()
                             favorites=favorites.get()
                             on_search=content_do_search.clone()
@@ -564,6 +760,7 @@ pub fn MainPage() -> impl IntoView {
                             favorites
                             on_select_ranking=content_select_ranking.clone()
                             on_play_song=content_play_song.clone()
+                            on_play_song_list=content_play_song_list.clone()
                             on_toggle_favorite_song=content_toggle_song.clone()
                         />
                     }.into_any(),
@@ -576,6 +773,7 @@ pub fn MainPage() -> impl IntoView {
                             favorites
                             on_select_playlist=content_select_playlist.clone()
                             on_play_song=content_play_song.clone()
+                            on_play_song_list=content_play_song_list.clone()
                             on_toggle_favorite_song=content_toggle_song.clone()
                             on_toggle_favorite_playlist=content_toggle_playlist.clone()
                         />
@@ -591,15 +789,24 @@ pub fn MainPage() -> impl IntoView {
                             do_search=content_do_search.clone()
                             favorites=favorites.get()
                             on_play_search_result=content_play_search.clone()
+                            on_append_search_results=content_append_search.clone()
                             on_toggle_favorite_song=content_toggle_song.clone()
+                            on_add_favorite_song=content_add_song.clone()
                         />
                     }.into_any(),
                     Page::Favorites => view! {
                         {render_favorites_view(
                             favorites.get(),
+                            favorite_playlist_detail.get(),
+                            favorite_playlist_loading.get(),
+                            favorite_playlist_error.get(),
                             content_play_song.clone(),
+                            content_play_song_list.clone(),
                             content_toggle_song.clone(),
                             content_toggle_playlist.clone(),
+                            content_select_favorite_playlist.clone(),
+                            favorite_playlist_detail,
+                            favorite_playlist_error,
                         )}
                     }.into_any(),
                     Page::Parser => view! {
@@ -611,15 +818,18 @@ pub fn MainPage() -> impl IntoView {
                             favorites=favorites.get()
                             on_parse=parse_shared_url.clone()
                             on_play_song=content_play_song.clone()
+                            on_play_song_list=content_play_song_list.clone()
                             on_toggle_favorite_song=content_toggle_song.clone()
                             on_toggle_favorite_playlist=content_toggle_playlist.clone()
                         />
                     }.into_any(),
                     Page::Settings => view! {
-                        <section class="section settings-page">
-                            <h2>"设置"</h2>
-                            <p>"设置功能即将上线"</p>
-                        </section>
+                        <SettingsView
+                            sources
+                            active_source
+                            on_move_source=content_move_source.clone()
+                            on_set_source_enabled=content_set_source_enabled.clone()
+                        />
                     }.into_any(),
                 }}
             </main>
@@ -728,10 +938,10 @@ pub fn MainPage() -> impl IntoView {
                                 <span class="fs-name">{source.name.clone()}</span>
                                 <span class="fs-status">{if enabled { "启用" } else { "禁用" }}</span>
                                 <div class="fs-actions">
-                                    <button on:click=move |_| move_up(source_id, "up".to_string())>"上移"</button>
-                                    <button on:click=move |_| move_down(source_id, "down".to_string())>"下移"</button>
-                                    <button on:click=move |_| move_top(source_id, "top".to_string())>"置顶"</button>
-                                    <button on:click=move |_| set_enabled(source_id, !enabled)>{if enabled { "禁用" } else { "启用" }}</button>
+                                    <button on:click=move |_| move_up(source_id, "up".to_string())><i class="iconfont icon-shangyishoushangyige"></i><span>"上移"</span></button>
+                                    <button on:click=move |_| move_down(source_id, "down".to_string())><i class="iconfont icon-xiayigexiayishou"></i><span>"下移"</span></button>
+                                    <button on:click=move |_| move_top(source_id, "top".to_string())><i class="iconfont icon-add-s"></i><span>"置顶"</span></button>
+                                    <button on:click=move |_| set_enabled(source_id, !enabled)><i class="iconfont icon-shujuyuan"></i><span>{if enabled { "禁用" } else { "启用" }}</span></button>
                                 </div>
                             </div>
                         }}
@@ -762,18 +972,14 @@ fn Sidebar(
     view! {
         <aside class="sidebar">
             <div class="sidebar-logo">
-                <div class="logo-icon">
-                    <svg width="28" height="28" viewBox="0 0 28 28" fill="none">
-                        <circle cx="14" cy="14" r="13" stroke="#39C5BB" stroke-width="2"/>
-                        <path d="M10 18V10l8 4-8 4z" fill="#39C5BB"/>
-                    </svg>
-                </div>
+                <div class="logo-icon"><i class="iconfont icon-yinle1"></i></div>
                 <span class="logo-text">"Miku Tunes"</span>
             </div>
             <nav class="sidebar-nav">
                 {nav_items.into_iter().map(|(page, label)| {
                     let page_for_active = page.clone();
                     let page_for_click = page.clone();
+                    let icon_class = page_icon_class(&page);
                     let callback = on_navigate.clone();
                     view! {
                         <a
@@ -784,6 +990,7 @@ fn Sidebar(
                                 callback(page_for_click.clone());
                             }
                         >
+                            <i class=format!("nav-icon iconfont {icon_class}")></i>
                             <span class="nav-label">{label}</span>
                         </a>
                     }
@@ -797,7 +1004,7 @@ fn Sidebar(
                     let playlist_for_click = playlist.clone();
                     view! {
                         <button class="playlist-item" on:click=move |_| on_select(playlist_for_click.clone())>
-                            <span class="playlist-icon">"♫"</span>
+                            <i class="playlist-icon iconfont icon-gedan"></i>
                             <span class="playlist-name">{playlist.name}</span>
                         </button>
                     }}
@@ -824,6 +1031,7 @@ fn HomeView(
     rankings: Vec<RankingCategory>,
     playlists: Vec<PlaylistInfo>,
     loading: bool,
+    init_error: Option<String>,
     sources: Vec<SourceInfo>,
     favorites: FavoritesData,
     on_search: std::sync::Arc<dyn Fn(String) + Send + Sync>,
@@ -854,11 +1062,22 @@ fn HomeView(
         }
     };
 
+    let init_err_msg = init_error.clone();
     view! {
         <section class="home-discovery">
+            {if let Some(msg) = init_err_msg.clone() {
+                view! {
+                    <div class="home-error-banner">
+                        <strong>"初始化失败: "</strong>
+                        {msg.clone()}
+                    </div>
+                }.into_any()
+            } else {
+                view! {}.into_any()
+            }}
             <div class="home-search-panel">
                 <div class="search-bar">
-                    <span class="search-icon">"Search"</span>
+                    <i class="search-icon iconfont icon-search"></i>
                     <input
                         class="search-input"
                         type="text"
@@ -880,7 +1099,7 @@ fn HomeView(
             <div class="home-shelf-grid">
                 <section class="home-shelf">
                     <div class="home-shelf-header">
-                        <button class="section-more-btn" on:click=move |_| on_more_rankings()>"查看更多"</button>
+                        <button class="section-more-btn" on:click=move |_| on_more_rankings()><i class="iconfont icon-jia"></i><span>"查看更多"</span></button>
                         <h2>"排行榜"</h2>
                         <span>{if loading {
                             "加载中".to_string()
@@ -911,13 +1130,13 @@ fn HomeView(
                 </section>
                 <section class="home-shelf">
                     <div class="home-shelf-header">
-                        <button class="section-more-btn" on:click=move |_| on_more_recommendations()>"查看更多"</button>
-                        <h2>"推荐歌曲"</h2>
-                        <span>"来自热门搜索"</span>
+                        <button class="section-more-btn" on:click=move |_| on_more_recommendations()><i class="iconfont icon-jia"></i><span>"查看更多"</span></button>
+                        <h2>"热门搜索"</h2>
+                        <span>"点击即可搜索"</span>
                     </div>
                     <div class="home-list">
                         {if hot_keywords.is_empty() {
-                            view! { <div class="home-empty">"暂无推荐歌曲"</div> }.into_any()
+                            view! { <div class="home-empty">"暂无热门搜索"</div> }.into_any()
                         } else {
                             hot_keywords.into_iter().take(6).map(|item| {
                                 let keyword = item.title.clone();
@@ -938,7 +1157,7 @@ fn HomeView(
             </div>
             <section class="home-shelf home-playlists">
                 <div class="home-shelf-header">
-                    <button class="section-more-btn" on:click=move |_| on_more_playlists()>"查看更多"</button>
+                    <button class="section-more-btn" on:click=move |_| on_more_playlists()><i class="iconfont icon-jia"></i><span>"查看更多"</span></button>
                     <h2>"歌单"</h2>
                     <span>"精选歌单"</span>
                 </div>
@@ -990,6 +1209,7 @@ fn ParserView(
     favorites: FavoritesData,
     on_parse: std::sync::Arc<dyn Fn(String) + Send + Sync>,
     on_play_song: std::sync::Arc<dyn Fn(String, String, String, usize, String) + Send + Sync>,
+    on_play_song_list: std::sync::Arc<dyn Fn(Vec<SongDetail>, usize) + Send + Sync>,
     on_toggle_favorite_song: std::sync::Arc<dyn Fn(FavoriteSong) + Send + Sync>,
     on_toggle_favorite_playlist: std::sync::Arc<dyn Fn(FavoritePlaylist) + Send + Sync>,
 ) -> impl IntoView {
@@ -1023,7 +1243,7 @@ fn ParserView(
                         on:keydown=parse_keydown
                     />
                 </div>
-                <button class="favorite-action parser-submit" on:click=parse_click>"开始解析"</button>
+                <button class="favorite-action parser-submit" on:click=parse_click><i class="iconfont icon-yunjiexi"></i><span>"开始解析"</span></button>
             </div>
             {render_shared_playlist_panel(
                 shared_playlist,
@@ -1031,6 +1251,7 @@ fn ParserView(
                 shared_error,
                 favorites,
                 on_play_song,
+                on_play_song_list,
                 on_toggle_favorite_song,
                 on_toggle_favorite_playlist,
             )}
@@ -1047,6 +1268,7 @@ fn RankingView(
     favorites: RwSignal<FavoritesData>,
     on_select_ranking: std::sync::Arc<dyn Fn(RankingCategory) + Send + Sync>,
     on_play_song: std::sync::Arc<dyn Fn(String, String, String, usize, String) + Send + Sync>,
+    on_play_song_list: std::sync::Arc<dyn Fn(Vec<SongDetail>, usize) + Send + Sync>,
     on_toggle_favorite_song: std::sync::Arc<dyn Fn(FavoriteSong) + Send + Sync>,
 ) -> impl IntoView {
     let show_detail = move || selected_ranking.get().is_some();
@@ -1057,7 +1279,7 @@ fn RankingView(
                     when=show_detail
                     fallback=move || view! { <h2 class="section-title">"排行榜"</h2> }
                 >
-                    <button class="back-btn" on:click=move |_| selected_ranking.set(None)>"返回"</button>
+                    <button class="back-btn" on:click=move |_| selected_ranking.set(None)><i class="iconfont icon-31fanhui1"></i><span>"返回"</span></button>
                     <h2 class="section-title">{move || selected_ranking.get().map(|item| item.name).unwrap_or_default()}</h2>
                 </Show>
             </div>
@@ -1068,21 +1290,24 @@ fn RankingView(
                     render_song_list(
                         ranking_songs.get(),
                         on_play_song.clone(),
+                        on_play_song_list.clone(),
                         favorites.get(),
                         on_toggle_favorite_song.clone(),
                     ).into_any()
                 } else {
-                    rankings.get().into_iter().map(|ranking| {
+                    view! { <div class="ranking-grid">
+                        {rankings.get().into_iter().map(|ranking| {
                         let on_select = on_select_ranking.clone();
                         let item = ranking.clone();
                         view! {
                             <button class="ranking-card" on:click=move |_| on_select(item.clone())>
-                                <div class="ranking-card-icon">"🏆"</div>
+                                <i class="ranking-card-icon iconfont icon-paihangbang"></i>
                                 <div class="ranking-card-name">{ranking.name}</div>
                                 <div class="ranking-card-source">{ranking.source_name}</div>
                             </button>
-                        }.into_any()
-                    }).collect::<Vec<_>>().into_any()
+                        }
+                    }).collect_view()}
+                    </div> }.into_any()
                 }
             }}
         </section>
@@ -1098,6 +1323,7 @@ fn PlaylistView(
     favorites: RwSignal<FavoritesData>,
     on_select_playlist: std::sync::Arc<dyn Fn(PlaylistInfo) + Send + Sync>,
     on_play_song: std::sync::Arc<dyn Fn(String, String, String, usize, String) + Send + Sync>,
+    on_play_song_list: std::sync::Arc<dyn Fn(Vec<SongDetail>, usize) + Send + Sync>,
     on_toggle_favorite_song: std::sync::Arc<dyn Fn(FavoriteSong) + Send + Sync>,
     on_toggle_favorite_playlist: std::sync::Arc<dyn Fn(FavoritePlaylist) + Send + Sync>,
 ) -> impl IntoView {
@@ -1109,7 +1335,7 @@ fn PlaylistView(
                     when=show_detail
                     fallback=move || view! { <h2 class="section-title">"歌单"</h2> }
                 >
-                    <button class="back-btn" on:click=move |_| selected_playlist.set(None)>"返回"</button>
+                    <button class="back-btn" on:click=move |_| selected_playlist.set(None)><i class="iconfont icon-31fanhui1"></i><span>"返回"</span></button>
                     <h2 class="section-title">{move || selected_playlist.get().map(|item| item.name).unwrap_or_default()}</h2>
                 </Show>
             </div>
@@ -1120,11 +1346,13 @@ fn PlaylistView(
                     render_song_list(
                         playlist_songs.get(),
                         on_play_song.clone(),
+                        on_play_song_list.clone(),
                         favorites.get(),
                         on_toggle_favorite_song.clone(),
                     ).into_any()
                 } else {
-                    playlists.get().into_iter().map(|playlist| {
+                    view! { <div class="playlist-grid">
+                        {playlists.get().into_iter().map(|playlist| {
                         let on_select = on_select_playlist.clone();
                         let toggle = on_toggle_favorite_playlist.clone();
                         let fav = favorite_from_playlist(&playlist, None);
@@ -1138,11 +1366,11 @@ fn PlaylistView(
                                 <button class="favorite-chip" class:active=is_fav on:click=move |ev| {
                                     ev.stop_propagation();
                                     toggle(fav_for_click.clone());
-                                }>"♥"</button>
+                                }><i class="iconfont icon-shoucang"></i></button>
                                 <div class="playlist-card-cover">
                                     <Show
                                         when=move || has_cover
-                                        fallback=move || view! { <span>"♫"</span> }
+                                        fallback=move || view! { <i class="iconfont icon-gedan"></i> }
                                     >
                                         <img src=cover_url.clone() alt="playlist" />
                                     </Show>
@@ -1153,8 +1381,9 @@ fn PlaylistView(
                                     <span>{playlist.song_count.map(|count| format!("{count} 首")).unwrap_or_default()}</span>
                                 </div>
                             </div>
-                        }.into_any()
-                    }).collect::<Vec<_>>().into_any()
+                        }
+                    }).collect_view()}
+                    </div> }.into_any()
                 }
             }}
         </section>
@@ -1172,10 +1401,15 @@ fn SearchView(
     do_search: std::sync::Arc<dyn Fn(String) + Send + Sync>,
     favorites: FavoritesData,
     on_play_search_result: std::sync::Arc<dyn Fn(Vec<SongResult>, usize) + Send + Sync>,
+    on_append_search_results: std::sync::Arc<dyn Fn(Vec<SongResult>) + Send + Sync>,
     on_toggle_favorite_song: std::sync::Arc<dyn Fn(FavoriteSong) + Send + Sync>,
+    on_add_favorite_song: std::sync::Arc<dyn Fn(FavoriteSong) + Send + Sync>,
 ) -> impl IntoView {
     let sort_mode = RwSignal::new(SearchSortMode::Source);
     let sort_desc = RwSignal::new(false);
+    let multi_select = RwSignal::new(false);
+    let selected_results = RwSignal::new(std::collections::HashSet::<String>::new());
+    let select_count = RwSignal::new("10".to_string());
     let on_input = {
         let schedule_search = schedule_search.clone();
         move |ev: leptos::ev::Event| {
@@ -1202,6 +1436,7 @@ fn SearchView(
         }
         results
     };
+    let bulk_add_favorite_song = on_add_favorite_song.clone();
     view! {
         <section class="search-page-hero">
             <div class="hero-text">
@@ -1263,28 +1498,127 @@ fn SearchView(
         </section>
         <section class="section search-results-section">
             <div class="section-header">
-                <h2 class="section-title">{move || {
-                    let keyword = search_query.get();
-                    if keyword.trim().is_empty() {
-                        "输入关键词开始搜索".to_string()
-                    } else {
-                        format!("搜索结果: {keyword}")
-                    }
-                }}</h2>
-                <span class="section-more">{move || {
-                    let total = search_results.get().len();
-                    if total >= 300 {
-                        "共 300+ 首".to_string()
-                    } else {
-                        format!("共 {total} 首")
-                    }
-                }}</span>
+                <div class="search-selection-tools">
+                    <span class="section-more">{move || {
+                        let total = search_results.get().len();
+                        let selected = selected_results.get().len();
+                        if total >= 300 {
+                            format!("300+ 首 · 已选 {selected}")
+                        } else {
+                            format!("{total} 首 · 已选 {selected}")
+                        }
+                    }}</span>
+                    <Show when=move || multi_select.get()>
+                        <input
+                            class="select-count-input"
+                            type="number"
+                            min="1"
+                            placeholder="前N首"
+                            prop:value=move || select_count.get()
+                            on:input=move |ev| select_count.set(event_target_value(&ev))
+                        />
+                        <button class="section-more-btn" on:click=move |_| {
+                            let count = select_count.get_untracked().parse::<usize>().unwrap_or(0);
+                            if count == 0 {
+                                return;
+                            }
+                            let mut results = sort_search_results(search_results.get(), sort_mode.get());
+                            if sort_desc.get() {
+                                results.reverse();
+                            }
+                            selected_results.set(
+                                results
+                                    .into_iter()
+                                    .take(count)
+                                    .map(|song| search_result_key(&song))
+                                    .collect()
+                            );
+                        }><i class="iconfont icon-add-s"></i><span>"选前N首"</span></button>
+                        <button class="section-more-btn" on:click=move |_| {
+                            selected_results.set(
+                                search_results
+                                    .get()
+                                    .into_iter()
+                                    .map(|song| search_result_key(&song))
+                                    .collect()
+                            );
+                        }><i class="iconfont icon-tianjiajiahaowubiankuang"></i><span>"全选"</span></button>
+                        <button class="section-more-btn" on:click=move |_| {
+                            selected_results.set(std::collections::HashSet::new());
+                        }><i class="iconfont icon-guanbi"></i><span>"清空"</span></button>
+                    </Show>
+                </div>
+                <div class="search-bulk-actions">
+                    <button class="section-more-btn" class:active=move || multi_select.get() on:click=move |_| {
+                        multi_select.update(|enabled| *enabled = !*enabled);
+                        selected_results.set(std::collections::HashSet::new());
+                    }><i class="iconfont icon-add-s"></i><span>{move || if multi_select.get() { "退出多选" } else { "多选" }}</span></button>
+                    <Show when=move || multi_select.get()>
+                        <button class="section-more-btn" on:click={
+                            let on_append = on_append_search_results.clone();
+                            move |_| {
+                                let selected = selected_results.get();
+                                let songs = search_results
+                                    .get()
+                                    .into_iter()
+                                    .filter(|song| selected.contains(&search_result_key(song)))
+                                    .collect::<Vec<_>>();
+                                if !songs.is_empty() {
+                                    on_append(songs);
+                                    selected_results.set(std::collections::HashSet::new());
+                                    multi_select.set(false);
+                                }
+                            }
+                        }><i class="iconfont icon-xiayigexiayishou"></i><span>{move || format!("稍后播放({})", selected_results.get().len())}</span></button>
+                        <button class="section-more-btn" on:click={
+                            let add = bulk_add_favorite_song.clone();
+                            move |_| {
+                                let selected = selected_results.get();
+                                for song in search_results
+                                    .get()
+                                    .into_iter()
+                                    .filter(|song| selected.contains(&search_result_key(song)))
+                                {
+                                    add(favorite_from_song_result(&song));
+                                }
+                                selected_results.set(std::collections::HashSet::new());
+                                multi_select.set(false);
+                            }
+                        }><i class="iconfont icon-shoucang"></i><span>{move || format!("批量收藏({})", selected_results.get().len())}</span></button>
+                        <button class="section-more-btn" on:click=move |_| {
+                            let selected = selected_results.get();
+                            let songs = search_results
+                                .get()
+                                .into_iter()
+                                .filter(|song| selected.contains(&search_result_key(song)))
+                                .collect::<Vec<_>>();
+                            if songs.is_empty() {
+                                return;
+                            }
+                            selected_results.set(std::collections::HashSet::new());
+                            multi_select.set(false);
+                            wasm_bindgen_futures::spawn_local(async move {
+                                for song in songs {
+                                    let args = js_sys::Object::new();
+                                    let _ = js_sys::Reflect::set(&args, &JsValue::from_str("sourceId"), &JsValue::from_f64(song.source_id as f64));
+                                    let _ = js_sys::Reflect::set(&args, &JsValue::from_str("songId"), &JsValue::from_str(&song.id));
+                                    let _ = js_sys::Reflect::set(&args, &JsValue::from_str("platform"), &JsValue::from_str(&song.platform));
+                                    let _ = js_sys::Reflect::set(&args, &JsValue::from_str("title"), &JsValue::from_str(&song.title));
+                                    let _ = js_sys::Reflect::set(&args, &JsValue::from_str("artist"), &JsValue::from_str(&song.artist));
+                                    let _ = invoke("download_song_by_id", Some(&args)).await;
+                                }
+                            });
+                        }><i class="iconfont icon-xiazai"></i><span>{move || format!("批量下载({})", selected_results.get().len())}</span></button>
+                    </Show>
+                </div>
             </div>
             <div class="search-results-list">
                 {move || render_search_list(
                     sorted_results(),
                     search_attempted.get(),
                     is_searching.get(),
+                    multi_select.get(),
+                    selected_results,
                     on_play_search_result.clone(),
                     favorites.clone(),
                     on_toggle_favorite_song.clone(),
@@ -1296,15 +1630,18 @@ fn SearchView(
 
 fn render_song_list(
     songs: Vec<SongDetail>,
-    on_play: std::sync::Arc<dyn Fn(String, String, String, usize, String) + Send + Sync>,
+    _on_play: std::sync::Arc<dyn Fn(String, String, String, usize, String) + Send + Sync>,
+    on_play_list: std::sync::Arc<dyn Fn(Vec<SongDetail>, usize) + Send + Sync>,
     favorites: FavoritesData,
     on_toggle_favorite: std::sync::Arc<dyn Fn(FavoriteSong) + Send + Sync>,
 ) -> Vec<leptos::prelude::AnyView> {
+    let queue = songs.clone();
     songs
         .into_iter()
-        .map(|song| {
-            let play = on_play.clone();
-            let play_song = song.clone();
+        .enumerate()
+        .map(|(index, song)| {
+            let play = on_play_list.clone();
+            let queue_for_click = queue.clone();
             let fav = favorite_from_song_detail(&song);
             let fav_for_click = fav.clone();
             let is_fav = favorites
@@ -1314,14 +1651,13 @@ fn render_song_list(
             let toggle = on_toggle_favorite.clone();
             let cover_url = song.cover_url.clone().unwrap_or_default();
             let has_cover_url = cover_url.clone();
-            let cover_text = song.title.chars().next().unwrap_or('♪').to_string();
             view! {
-                <div class="song-list-item" on:click=move |_| play(play_song.title.clone(), play_song.artist.clone(), play_song.id.clone(), play_song.source_id, play_song.platform.clone())>
-                    <span class="sli-play">"▶"</span>
+                <div class="song-list-item" on:click=move |_| play(queue_for_click.clone(), index)>
+                    <i class="sli-play iconfont icon-bofang"></i>
                     <span class="sli-cover">
                         <Show
                             when=move || !has_cover_url.is_empty()
-                            fallback=move || view! { <span>{cover_text.clone()}</span> }
+                            fallback=move || view! { <i class="iconfont icon-yinle1"></i> }
                         >
                             <img
                                 src=cover_url.clone()
@@ -1342,7 +1678,7 @@ fn render_song_list(
                     <button class="favorite-chip" class:active=is_fav on:click=move |ev| {
                         ev.stop_propagation();
                         toggle(fav_for_click.clone());
-                    }>"♥"</button>
+                    }><i class="iconfont icon-shoucang"></i></button>
                 </div>
             }.into_any()
         })
@@ -1389,44 +1725,12 @@ fn sort_search_results(mut results: Vec<SongResult>, mode: SearchSortMode) -> Ve
     results
 }
 
-fn quality_rank(song: &SongResult) -> i32 {
-    match song.platform.as_str() {
-        "kw" | "kg" | "tx" => 3,
-        "wy" | "mg" => 2,
-        _ => 1,
-    }
-}
-
-fn search_result_key(song: &SongResult) -> String {
-    if song.id.trim().is_empty() {
-        format!("fallback::{}::{}::{}", song.title, song.artist, song.platform)
-    } else {
-        format!("{}::{}::{}", song.source_id, song.platform, song.id)
-    }
-}
-
-fn merge_search_results(current: &mut Vec<SongResult>, incoming: Vec<SongResult>) {
-    let mut seen = current
-        .iter()
-        .map(search_result_key)
-        .collect::<std::collections::HashSet<_>>();
-    for song in incoming {
-        if seen.insert(search_result_key(&song)) {
-            current.push(song);
-        }
-    }
-}
-
-fn dedupe_search_results(results: Vec<SongResult>) -> Vec<SongResult> {
-    let mut out = Vec::new();
-    merge_search_results(&mut out, results);
-    out
-}
-
 fn render_search_list(
     results: Vec<SongResult>,
     attempted: bool,
     searching: bool,
+    multi_select: bool,
+    selected: RwSignal<std::collections::HashSet<String>>,
     on_play: std::sync::Arc<dyn Fn(Vec<SongResult>, usize) + Send + Sync>,
     favorites: FavoritesData,
     on_toggle_favorite: std::sync::Arc<dyn Fn(FavoriteSong) + Send + Sync>,
@@ -1440,13 +1744,17 @@ fn render_search_list(
         }
         return Vec::new();
     }
-    let queue = results.clone();
     results
         .into_iter()
         .enumerate()
-        .map(|(index, song)| {
-            let queue_for_click = queue.clone();
+        .map(|(_index, song)| {
             let play = on_play.clone();
+            let song_for_click = song.clone();
+            let selected_for_click = selected.clone();
+            let key_for_click = search_result_key(&song);
+            let key_for_class = key_for_click.clone();
+            let key_for_check_text = key_for_click.clone();
+            let checked = Memo::new(move |_| selected.get().contains(&key_for_check_text));
             let fav = favorite_from_song_result(&song);
             let fav_for_click = fav.clone();
             let is_fav = favorites
@@ -1457,15 +1765,27 @@ fn render_search_list(
             let duration = song.duration.map(format_time).unwrap_or_else(|| "--:--".to_string());
             let cover_url = song.cover_url.clone().unwrap_or_default();
             let has_cover_url = cover_url.clone();
-            let cover_text = song.title.chars().next().unwrap_or('♪').to_string();
             let quality = song.quality.clone().unwrap_or_else(|| "未知".to_string());
             view! {
-                <div class="song-list-item" on:click=move |_| play(queue_for_click.clone(), index)>
-                    <span class="sli-play">"▶"</span>
+                <div class="song-list-item" class:selected=move || selected.get().contains(&key_for_class) on:click=move |_| {
+                    if multi_select {
+                        selected_for_click.update(|set| {
+                            if !set.remove(&key_for_click) {
+                                set.insert(key_for_click.clone());
+                            }
+                        });
+                    } else {
+                        play(vec![song_for_click.clone()], 0);
+                    }
+                }>
+                    <Show when=move || multi_select>
+                        <span class="sli-check">{move || if checked.get() { "✓" } else { "" }}</span>
+                    </Show>
+                    <i class="sli-play iconfont icon-bofang"></i>
                     <span class="sli-cover">
                         <Show
                             when=move || !has_cover_url.is_empty()
-                            fallback=move || view! { <span>{cover_text.clone()}</span> }
+                            fallback=move || view! { <i class="iconfont icon-yinle1"></i> }
                         >
                             <img
                                 src=cover_url.clone()
@@ -1490,7 +1810,7 @@ fn render_search_list(
                     <button class="favorite-chip" class:active=is_fav on:click=move |ev| {
                         ev.stop_propagation();
                         toggle(fav_for_click.clone());
-                    }>"♥"</button>
+                    }><i class="iconfont icon-shoucang"></i></button>
                 </div>
             }
             .into_any()
@@ -1504,6 +1824,7 @@ fn render_shared_playlist_panel(
     error: Option<String>,
     favorites: FavoritesData,
     on_play_song: std::sync::Arc<dyn Fn(String, String, String, usize, String) + Send + Sync>,
+    on_play_song_list: std::sync::Arc<dyn Fn(Vec<SongDetail>, usize) + Send + Sync>,
     on_toggle_song: std::sync::Arc<dyn Fn(FavoriteSong) + Send + Sync>,
     on_toggle_playlist: std::sync::Arc<dyn Fn(FavoritePlaylist) + Send + Sync>,
 ) -> leptos::prelude::AnyView {
@@ -1540,7 +1861,8 @@ fn render_shared_playlist_panel(
             <div class="home-shelf-header">
                 <h2>{shared.playlist.name}</h2>
                 <button class="favorite-action" class:active=is_playlist_fav on:click=move |_| toggle_playlist(playlist_for_click.clone())>
-                    {if is_playlist_fav { "已收藏歌单" } else { "收藏此歌单" }}
+                    <i class="iconfont icon-shoucang"></i>
+                    <span>{if is_playlist_fav { "已收藏歌单" } else { "收藏此歌单" }}</span>
                 </button>
             </div>
             <Show when=move || note_for_check.is_some()>
@@ -1550,7 +1872,7 @@ fn render_shared_playlist_panel(
                 {if songs.is_empty() {
                     view! { <div class="home-empty">"已识别歌单链接，但暂时没有拿到歌曲列表。"</div> }.into_any()
                 } else {
-                    render_song_list(songs, on_play_song, favorites, on_toggle_song).into_any()
+                    render_song_list(songs, on_play_song, on_play_song_list, favorites, on_toggle_song).into_any()
                 }}
             </div>
         </section>
@@ -1560,12 +1882,61 @@ fn render_shared_playlist_panel(
 
 fn render_favorites_view(
     data: FavoritesData,
+    detail: Option<SharedPlaylist>,
+    detail_loading: bool,
+    detail_error: Option<String>,
     on_play_song: std::sync::Arc<dyn Fn(String, String, String, usize, String) + Send + Sync>,
+    on_play_song_list: std::sync::Arc<dyn Fn(Vec<SongDetail>, usize) + Send + Sync>,
     on_toggle_song: std::sync::Arc<dyn Fn(FavoriteSong) + Send + Sync>,
     on_toggle_playlist: std::sync::Arc<dyn Fn(FavoritePlaylist) + Send + Sync>,
-) -> impl IntoView {
+    on_select_playlist: std::sync::Arc<dyn Fn(FavoritePlaylist) + Send + Sync>,
+    detail_signal: RwSignal<Option<SharedPlaylist>>,
+    detail_error_signal: RwSignal<Option<String>>,
+) -> leptos::prelude::AnyView {
     let songs = data.songs.clone();
     let playlists = data.playlists.clone();
+    if detail_loading || detail.is_some() || detail_error.is_some() {
+        let title = detail
+            .as_ref()
+            .map(|item| item.playlist.name.clone())
+            .unwrap_or_else(|| "收藏歌单".to_string());
+        let count = detail
+            .as_ref()
+            .map(|item| format!("{} 首", item.songs.len()))
+            .unwrap_or_default();
+        let reset_detail = move |_| {
+            detail_signal.set(None);
+            detail_error_signal.set(None);
+        };
+        return view! {
+            <section class="section favorites-page">
+                <div class="section-header">
+                    <button class="back-btn" on:click=reset_detail><i class="iconfont icon-31fanhui1"></i><span>"返回收藏"</span></button>
+                    <h2 class="section-title">{title}</h2>
+                    <span class="section-more">{count}</span>
+                </div>
+                <div class="search-results-list favorite-playlist-detail">
+                    {if detail_loading {
+                        view! { <div class="loading-container"><div class="loading-spinner"></div><p>"正在加载歌单..."</p></div> }.into_any()
+                    } else if let Some(shared) = detail {
+                        if shared.songs.is_empty() {
+                            view! { <div class="home-empty">{shared.note.or(detail_error).unwrap_or_else(|| "这个收藏歌单暂时没有解析到歌曲".to_string())}</div> }.into_any()
+                        } else {
+                            render_song_list(
+                                shared.songs,
+                                on_play_song.clone(),
+                                on_play_song_list.clone(),
+                                data.clone(),
+                                on_toggle_song.clone(),
+                            ).into_any()
+                        }
+                    } else {
+                        view! { <div class="home-empty">{detail_error.unwrap_or_else(|| "歌单加载失败".to_string())}</div> }.into_any()
+                    }}
+                </div>
+            </section>
+        }.into_any();
+    }
     view! {
         <section class="section favorites-page">
             <div class="section-header">
@@ -1587,10 +1958,10 @@ fn render_favorites_view(
                                 view! {
                                     <div class="favorite-row">
                                         <button class="favorite-main" on:click=move |_| play(play_song.title.clone(), play_song.artist.clone(), play_song.id.clone(), play_song.source_id, play_song.platform.clone())>
-                                            <span class="favorite-cover">"♪"</span>
+                                            <span class="favorite-cover"><i class="iconfont icon-yinle1"></i></span>
                                             <span class="home-item-main"><strong>{song.title}</strong><small>{song.artist}</small></span>
                                         </button>
-                                        <button class="favorite-remove" on:click=move |_| remove(remove_song.clone())>"取消收藏"</button>
+                                        <button class="favorite-remove" on:click=move |_| remove(remove_song.clone())><i class="iconfont icon-guanbi"></i><span>"取消收藏"</span></button>
                                     </div>
                                 }.into_any()
                             }).collect::<Vec<_>>().into_any()
@@ -1604,21 +1975,216 @@ fn render_favorites_view(
                             view! { <div class="home-empty">"还没有收藏歌单"</div> }.into_any()
                         } else {
                             playlists.into_iter().map(|playlist| {
+                                let select = on_select_playlist.clone();
                                 let remove = on_toggle_playlist.clone();
+                                let select_playlist = playlist.clone();
                                 let remove_playlist = playlist.clone();
                                 view! {
                                     <div class="favorite-row">
-                                        <div class="favorite-main static">
-                                            <span class="favorite-cover playlist">"♫"</span>
+                                        <button class="favorite-main" on:click=move |_| select(select_playlist.clone())>
+                                            <span class="favorite-cover playlist"><i class="iconfont icon-gedan"></i></span>
                                             <span class="home-item-main"><strong>{playlist.name}</strong><small>{playlist.source_name}</small></span>
-                                        </div>
-                                        <button class="favorite-remove" on:click=move |_| remove(remove_playlist.clone())>"取消收藏"</button>
+                                        </button>
+                                        <button class="favorite-remove" on:click=move |_| remove(remove_playlist.clone())><i class="iconfont icon-guanbi"></i><span>"取消收藏"</span></button>
                                     </div>
                                 }.into_any()
                             }).collect::<Vec<_>>().into_any()
                         }}
                     </div>
                 </section>
+            </div>
+        </section>
+    }.into_any()
+}
+
+#[component]
+fn SettingsView(
+    sources: RwSignal<Vec<SourceInfo>>,
+    active_source: RwSignal<Option<SourceInfo>>,
+    on_move_source: std::sync::Arc<dyn Fn(usize, String) + Send + Sync>,
+    on_set_source_enabled: std::sync::Arc<dyn Fn(usize, bool) + Send + Sync>,
+) -> impl IntoView {
+    let theme = RwSignal::new("深色".to_string());
+    let download_path = RwSignal::new("系统下载目录 / MikuTunes".to_string());
+    let preferred_quality = RwSignal::new("320k 优先".to_string());
+    let lyric_translate = RwSignal::new(false);
+    let download_drives = RwSignal::new(Vec::<String>::new());
+    let download_status = RwSignal::new(String::new());
+    {
+        let download_path = download_path.clone();
+        let download_drives = download_drives.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(value) = invoke("get_download_dir", None).await {
+                if let Some(path) = value.as_string() {
+                    download_path.set(path);
+                }
+            }
+            if let Ok(value) = invoke("list_windows_drives", None).await {
+                if let Ok(drives) = serde_wasm_bindgen::from_value::<Vec<String>>(value) {
+                    download_drives.set(drives);
+                }
+            }
+        });
+    }
+    let save_download_path = {
+        let download_path = download_path.clone();
+        let download_status = download_status.clone();
+        move |_| {
+            let path = download_path.get();
+            download_status.set("正在保存...".to_string());
+            let download_path = download_path.clone();
+            let download_status = download_status.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let args = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(
+                    &args,
+                    &JsValue::from_str("path"),
+                    &JsValue::from_str(&path),
+                );
+                match invoke("set_download_dir", Some(&args)).await {
+                    Ok(value) => {
+                        if let Some(saved) = value.as_string() {
+                            download_path.set(saved);
+                        }
+                        download_status.set("已保存".to_string());
+                    }
+                    Err(err) => download_status
+                        .set(err.as_string().unwrap_or_else(|| "保存失败".to_string())),
+                }
+            });
+        }
+    };
+    let open_git = move |_| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.open_with_url("https://github.com/djyasdfghjkl/rust_music");
+        }
+    };
+    view! {
+        <section class="section settings-page">
+            <div class="settings-band settings-system">
+                <div class="settings-band-header">
+                    <div>
+                        <span class="settings-kicker">"System"</span>
+                        <h2>"系统设置"</h2>
+                    </div>
+                    <span class="settings-pill">{move || active_source.get().map(|source| source.name).unwrap_or_else(|| "全部音源".to_string())}</span>
+                </div>
+                <div class="settings-grid">
+                    <label class="setting-field">
+                        <span>"主题"</span>
+                        <select prop:value=move || theme.get() on:change=move |ev| theme.set(event_target_value(&ev))>
+                            <option value="深色">"深色"</option>
+                            <option value="浅色">"浅色"</option>
+                            <option value="跟随系统">"跟随系统"</option>
+                        </select>
+                    </label>
+                    <div class="setting-field wide download-setting">
+                        <span>"下载位置"</span>
+                        <div class="download-path-row">
+                            <input
+                                type="text"
+                                prop:value=move || download_path.get()
+                                on:input=move |ev| download_path.set(event_target_value(&ev))
+                            />
+                            <button type="button" class="settings-save-btn" on:click=save_download_path><i class="iconfont icon-wenjianjia"></i><span>"保存"</span></button>
+                        </div>
+                        <div class="download-drive-row">
+                            {move || download_drives.get().into_iter().map(|drive| {
+                                let drive_for_click = drive.clone();
+                                let drive_for_active = drive.clone();
+                                view! {
+                                    <button
+                                        type="button"
+                                        class="drive-chip"
+                                        class:active=move || download_path.get().starts_with(&drive_for_active)
+                                        on:click=move |_| download_path.set(format!("{drive_for_click}MikuTunes"))
+                                    >{drive}</button>
+                                }
+                            }).collect_view()}
+                            <span class="download-status">{move || download_status.get()}</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="settings-source-manager">
+                    <div class="settings-subhead">
+                        <strong>"音源管理"</strong>
+                        <small>{move || format!("{} 个音源，按当前执行顺序排列", sources.get().len())}</small>
+                    </div>
+                    <div class="settings-source-list">
+                        <For each=move || sources.get() key=|source| source.id let:source>
+                            {let source_id = source.id;
+                            let enabled = source.enabled;
+                            let move_up = on_move_source.clone();
+                            let move_down = on_move_source.clone();
+                            let move_top = on_move_source.clone();
+                            let set_enabled = on_set_source_enabled.clone();
+                            view! {
+                                <div class="settings-source-row" class:disabled=move || !enabled>
+                                    <span class="source-order">{source_id}</span>
+                                    <span class="source-name">{source.name}</span>
+                                    <span class="source-state">{if enabled { "启用" } else { "禁用" }}</span>
+                                    <button on:click=move |_| move_top(source_id, "top".to_string())><i class="iconfont icon-add-s"></i><span>"置顶"</span></button>
+                                    <button on:click=move |_| move_up(source_id, "up".to_string())><i class="iconfont icon-shangyishoushangyige"></i><span>"上移"</span></button>
+                                    <button on:click=move |_| move_down(source_id, "down".to_string())><i class="iconfont icon-xiayigexiayishou"></i><span>"下移"</span></button>
+                                    <button on:click=move |_| set_enabled(source_id, !enabled)><i class="iconfont icon-shujuyuan"></i><span>{if enabled { "禁用" } else { "启用" }}</span></button>
+                                </div>
+                            }}
+                        </For>
+                    </div>
+                </div>
+            </div>
+
+            <div class="settings-band settings-music">
+                <div class="settings-band-header">
+                    <div>
+                        <span class="settings-kicker">"Music"</span>
+                        <h2>"音乐设置"</h2>
+                    </div>
+                </div>
+                <div class="settings-grid">
+                    <label class="setting-field">
+                        <span>"优先播放音质"</span>
+                        <select prop:value=move || preferred_quality.get() on:change=move |ev| preferred_quality.set(event_target_value(&ev))>
+                            <option value="无损优先">"无损优先"</option>
+                            <option value="320k 优先">"320k 优先"</option>
+                            <option value="128k 优先">"128k 优先"</option>
+                        </select>
+                    </label>
+                    <label class="setting-toggle">
+                        <input
+                            type="checkbox"
+                            prop:checked=move || lyric_translate.get()
+                            on:change=move |ev| {
+                                let checked = event_target::<web_sys::HtmlInputElement>(&ev).checked();
+                                lyric_translate.set(checked);
+                            }
+                        />
+                        <span>"显示歌词翻译"</span>
+                    </label>
+                    <label class="setting-toggle">
+                        <input type="checkbox" checked />
+                        <span>"切歌时自动重新加载歌词"</span>
+                    </label>
+                </div>
+            </div>
+
+            <div class="settings-band settings-project">
+                <div class="settings-band-header">
+                    <div>
+                        <span class="settings-kicker">"Project"</span>
+                        <h2>"我的项目信息"</h2>
+                    </div>
+                    <button class="project-git-btn" on:click=open_git>
+                        <i class="iconfont icon-github-fill"></i>
+                        <strong>"打开仓库"</strong>
+                    </button>
+                </div>
+                <div class="project-info-grid">
+                    <div><span>"项目"</span><strong>"Miku Tunes"</strong></div>
+                    <div><span>"版本"</span><strong>"1.0.0"</strong></div>
+                    <div><span>"联系"</span><strong>"GitHub Issues"</strong></div>
+                    <div><span>"仓库"</span><strong>"github.com/djyasdfghjkl/rust_music"</strong></div>
+                </div>
             </div>
         </section>
     }

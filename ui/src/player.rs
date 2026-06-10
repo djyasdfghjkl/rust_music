@@ -1,5 +1,5 @@
 use crate::tauri_utils::{convert_file_src, invoke};
-use crate::types::{FavoriteSong, FavoritesData, SongInfoResult, SongResult};
+use crate::types::{FavoriteSong, FavoritesData, SongDetail, SongInfoResult, SongResult};
 use leptos::prelude::*;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -50,6 +50,16 @@ impl TrackInfo {
         track.platform = song.platform.clone();
         track.cover_url = song.cover_url.clone();
         track.quality = song.quality.clone();
+        track.duration = song.duration;
+        track
+    }
+
+    pub fn from_song_detail(song: &SongDetail) -> Self {
+        let mut track = Self::from_song(&song.title, &song.artist);
+        track.source_id = song.source_id;
+        track.song_id = song.id.clone();
+        track.platform = song.platform.clone();
+        track.cover_url = song.cover_url.clone();
         track.duration = song.duration;
         track
     }
@@ -130,18 +140,8 @@ fn get_or_create_audio() -> JsValue {
     audio.into()
 }
 
-fn create_audio_analyser(audio: &JsValue) -> Option<(web_sys::AnalyserNode, Vec<u8>)> {
-    let context = web_sys::AudioContext::new().ok()?;
-    let element = audio.clone().dyn_into::<web_sys::HtmlAudioElement>().ok()?;
-    let source = context.create_media_element_source(&element).ok()?;
-    let analyser = context.create_analyser().ok()?;
-    analyser.set_fft_size(64);
-    source.connect_with_audio_node(&analyser).ok()?;
-    analyser
-        .connect_with_audio_node(&context.destination())
-        .ok()?;
-    let buffer = vec![0; analyser.frequency_bin_count() as usize];
-    Some((analyser, buffer))
+fn create_audio_analyser(_audio: &JsValue) -> Option<(web_sys::AnalyserNode, Vec<u8>)> {
+    None
 }
 
 macro_rules! audio_call {
@@ -209,9 +209,7 @@ pub fn setup_audio_events(state: PlayerState) {
                     ((total / count.max(1.0)) / 255.0).clamp(0.06, 1.0)
                 })
                 .collect::<Vec<_>>();
-            if state_time.is_playing.get_untracked()
-                && bars.iter().all(|value| *value <= 0.08)
-            {
+            if state_time.is_playing.get_untracked() && bars.iter().all(|value| *value <= 0.08) {
                 bars = animated_spectrum(current_time);
             }
             state_time.spectrum.set(bars);
@@ -295,7 +293,7 @@ pub fn play_url(url: &str) {
 
 fn resume_or_play_url(url: &str) {
     let current_src = audio_get!("src").as_string().unwrap_or_default();
-    if !current_src.is_empty() {
+    if !current_src.is_empty() && current_src == url {
         audio_call!("play");
     } else {
         play_url(url);
@@ -367,9 +365,21 @@ pub fn play_track_at(state: PlayerState, index: usize, open_full_player: bool) {
         state.show_full_player.set(true);
     }
 
-    if let Some(url) = track.url {
+    if let Some(url) = track.url.clone() {
         play_url(&url);
-        state.is_playing.set(true);
+        if !track.song_id.is_empty() {
+            let state_for_info = state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                fetch_song_info_for_track(
+                    &state_for_info,
+                    index,
+                    track.source_id,
+                    &track.song_id,
+                    &track.platform,
+                )
+                .await;
+            });
+        }
         return;
     }
 
@@ -400,6 +410,74 @@ pub fn replace_queue_and_play(state: PlayerState, songs: Vec<SongResult>, index:
     play_track_at(state, index, true);
 }
 
+pub fn replace_queue_with_song_details_and_play(
+    state: PlayerState,
+    songs: Vec<SongDetail>,
+    index: usize,
+) {
+    let queue = songs
+        .iter()
+        .map(TrackInfo::from_song_detail)
+        .collect::<Vec<_>>();
+    if queue.is_empty() || index >= queue.len() {
+        return;
+    }
+    state.queue.set(queue);
+    state.show_queue.set(false);
+    play_track_at(state, index, true);
+}
+
+pub fn append_search_results_to_queue(state: PlayerState, songs: Vec<SongResult>) {
+    let mut queue = state.queue.get_untracked();
+    let was_empty = queue.is_empty();
+    queue.extend(songs.iter().map(TrackInfo::from_search_result));
+    state.queue.set(queue);
+    if was_empty && state.current_index.get_untracked().is_none() {
+        state.current_index.set(Some(0));
+        state.show_queue.set(true);
+    }
+}
+
+fn current_track_matches(state: &PlayerState, idx: usize, song_id: &str, platform: &str) -> bool {
+    state.current_index.get_untracked() == Some(idx)
+        && state
+            .queue
+            .get_untracked()
+            .get(idx)
+            .is_some_and(|track| track.song_id == song_id && track.platform == platform)
+}
+
+fn playable_url_from_result(result: &crate::types::SongUrlResult) -> String {
+    if result.url.contains(":\\") || result.url.starts_with("\\\\") {
+        convert_file_src(&result.url, Some("asset"))
+    } else {
+        result.url.clone()
+    }
+}
+
+fn apply_song_url_result(
+    state: &PlayerState,
+    idx: usize,
+    result: crate::types::SongUrlResult,
+) -> Option<String> {
+    let playable_url = playable_url_from_result(&result);
+    if playable_url.trim().is_empty() {
+        state.is_resolving.set(false);
+        state.is_playing.set(false);
+        audio_call!("pause");
+        state.last_error.set(Some("播放链接为空".to_string()));
+        return None;
+    }
+    let mut queue = state.queue.get();
+    if let Some(track) = queue.get_mut(idx) {
+        track.url = Some(playable_url.clone());
+        track.quality = Some(result.quality);
+        track.format = Some(result.format);
+    }
+    state.queue.set(queue);
+    Some(playable_url)
+}
+
 pub async fn play_song_by_id(
     state: &PlayerState,
     idx: usize,
@@ -408,7 +486,9 @@ pub async fn play_song_by_id(
     platform: &str,
 ) {
     state.is_resolving.set(true);
+    state.is_playing.set(false);
     state.last_error.set(None);
+    state.song_info.set(None);
 
     let args = js_sys::Object::new();
     let _ = js_sys::Reflect::set(
@@ -430,52 +510,132 @@ pub async fn play_song_by_id(
     match invoke("get_song_url", Some(&args)).await {
         Ok(value) => match serde_wasm_bindgen::from_value::<crate::types::SongUrlResult>(value) {
             Ok(result) => {
-                let playable_url = if result.url.contains(":\\") || result.url.starts_with("\\\\") {
-                    convert_file_src(&result.url, Some("asset"))
-                } else {
-                    result.url.clone()
-                };
-                let mut queue = state.queue.get();
-                if let Some(track) = queue.get_mut(idx) {
-                    track.url = Some(playable_url.clone());
-                    track.quality = Some(result.quality.clone());
-                    track.format = Some(result.format.clone());
+                if let Some(playable_url) = apply_song_url_result(state, idx, result) {
+                    play_url(&playable_url);
                 }
-                state.queue.set(queue);
-                play_url(&playable_url);
-                state.is_playing.set(true);
-                state.is_resolving.set(false);
             }
             Err(_) => {
                 state.is_resolving.set(false);
-                state
-                    .last_error
-                    .set(Some("播放链接返回格式异常".to_string()));
+                state.is_playing.set(false);
+                audio_call!("pause");
+                state.last_error.set(Some(
+                    "播放链接返回格式异常，请重新搜索或切换网络后再试".to_string(),
+                ));
             }
         },
         Err(error) => {
-            state.is_resolving.set(false);
-            let msg = error.as_string().unwrap_or_else(|| {
+            let first_msg = error.as_string().unwrap_or_else(|| {
                 format!(
                     "请求播放链接失败：source_id={}, song_id={}, platform={}",
                     source_id, song_id, platform
                 )
             });
-            state.last_error.set(Some(msg));
+            state
+                .last_error
+                .set(Some(format!("{first_msg}，正在尝试其它音源...")));
+
+            if let Some(track) = state.queue.get_untracked().get(idx).cloned() {
+                let fallback_args = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(
+                    &fallback_args,
+                    &JsValue::from_str("title"),
+                    &JsValue::from_str(&track.title),
+                );
+                let _ = js_sys::Reflect::set(
+                    &fallback_args,
+                    &JsValue::from_str("artist"),
+                    &JsValue::from_str(&track.artist),
+                );
+                let _ = js_sys::Reflect::set(
+                    &fallback_args,
+                    &JsValue::from_str("failedSourceId"),
+                    &JsValue::from_f64(source_id as f64),
+                );
+                let _ = js_sys::Reflect::set(
+                    &fallback_args,
+                    &JsValue::from_str("failedSongId"),
+                    &JsValue::from_str(song_id),
+                );
+                let _ = js_sys::Reflect::set(
+                    &fallback_args,
+                    &JsValue::from_str("failedPlatform"),
+                    &JsValue::from_str(platform),
+                );
+                if let Ok(value) = invoke("get_song_url_fallback", Some(&fallback_args)).await {
+                    if let Ok(result) =
+                        serde_wasm_bindgen::from_value::<crate::types::SongUrlResult>(value)
+                    {
+                        if let Some(playable_url) = apply_song_url_result(state, idx, result) {
+                            state.last_error.set(None);
+                            play_url(&playable_url);
+                            fetch_song_info_with_args(state, idx, &args).await;
+                            return;
+                        }
+                    }
+                }
+            }
+
+            state.is_resolving.set(false);
+            state.is_playing.set(false);
+            audio_call!("pause");
+            state.last_error.set(Some(format!(
+                "{first_msg}。已尝试其它音源仍失败，请检查网络代理/DNS，或重新搜索后再播放。"
+            )));
         }
     }
 
-    if let Ok(value) = invoke("get_song_info", Some(&args)).await {
+    fetch_song_info_with_args(state, idx, &args).await;
+}
+
+async fn fetch_song_info_for_track(
+    state: &PlayerState,
+    idx: usize,
+    source_id: usize,
+    song_id: &str,
+    platform: &str,
+) {
+    let args = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &args,
+        &JsValue::from_str("sourceId"),
+        &JsValue::from_f64(source_id as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &args,
+        &JsValue::from_str("songId"),
+        &JsValue::from_str(song_id),
+    );
+    let _ = js_sys::Reflect::set(
+        &args,
+        &JsValue::from_str("platform"),
+        &JsValue::from_str(platform),
+    );
+    fetch_song_info_with_args(state, idx, &args).await;
+}
+
+async fn fetch_song_info_with_args(state: &PlayerState, idx: usize, args: &js_sys::Object) {
+    let requested_song_id = js_sys::Reflect::get(args, &JsValue::from_str("songId"))
+        .ok()
+        .and_then(|value| value.as_string())
+        .unwrap_or_default();
+    let requested_platform = js_sys::Reflect::get(args, &JsValue::from_str("platform"))
+        .ok()
+        .and_then(|value| value.as_string())
+        .unwrap_or_default();
+    if let Ok(value) = invoke("get_song_info", Some(args)).await {
         if let Ok(info) = serde_wasm_bindgen::from_value::<crate::types::SongInfoResult>(value) {
+            if !current_track_matches(state, idx, &requested_song_id, &requested_platform) {
+                return;
+            }
             let mut queue = state.queue.get();
             if let Some(track) = queue.get_mut(idx) {
                 track.cover_url = info.cover_url.clone();
+                track.duration = info.duration.or(track.duration);
             }
             state.queue.set(queue);
             state.song_info.set(Some(info));
         }
     }
-    state.is_resolving.set(false);
 }
 
 pub fn format_time(secs: f64) -> String {
@@ -527,11 +687,11 @@ pub fn PlayerBar(
             )
         }
     };
-    let play_icon = move || {
+    let _play_icon = move || {
         if state.is_playing.get() {
-            "暂停"
+            "⏸"
         } else {
-            "播放"
+            "▶"
         }
     };
     let progress = move || format!("width:{}%", (state.progress.get() * 100.0).round());
@@ -564,6 +724,12 @@ pub fn PlayerBar(
         )
     };
     let bar_volume_value = move || ((state.volume.get() * 100.0).round() as i32).to_string();
+    let bar_volume_style = move || {
+        let value = (state.volume.get() * 100.0).round().clamp(0.0, 100.0);
+        format!(
+            "background:linear-gradient(to right,#39C5BB 0%,#39C5BB {value}%,rgba(255,255,255,0.18) {value}%,rgba(255,255,255,0.18) 100%);"
+        )
+    };
     let on_bar_volume = {
         let state = state.clone();
         move |ev: leptos::ev::Event| {
@@ -588,7 +754,6 @@ pub fn PlayerBar(
             if let Some(track) = play_click_state.queue.get().get(index).cloned() {
                 if let Some(url) = track.url {
                     resume_or_play_url(&url);
-                    play_click_state.is_playing.set(true);
                 } else if !track.song_id.is_empty() {
                     let state_clone = play_click_state.clone();
                     wasm_bindgen_futures::spawn_local(async move {
@@ -604,6 +769,16 @@ pub fn PlayerBar(
                 }
             }
         }
+    };
+    let prev_click_state = state.clone();
+    let on_prev_click = move |ev: leptos::ev::MouseEvent| {
+        ev.stop_propagation();
+        prev_track(prev_click_state.clone());
+    };
+    let next_click_state = state.clone();
+    let on_next_click = move |ev: leptos::ev::MouseEvent| {
+        ev.stop_propagation();
+        next_track(next_click_state.clone());
     };
 
     let open_player = {
@@ -628,6 +803,16 @@ pub fn PlayerBar(
                     <span class="player-bar-title">{title}</span>
                     <span class="player-bar-artist">{artist}</span>
                 </div>
+                <div class="player-bar-controls" on:click=move |ev| ev.stop_propagation()>
+                    <button class="pb-btn" on:click=on_prev_click><i class="btn-icon iconfont icon-shangyishoushangyige"></i></button>
+                    <button class="pb-btn" on:click=on_play_click>
+                        <i class=move || if state.is_playing.get() { "btn-icon iconfont icon-zanting" } else { "btn-icon iconfont icon-bofang" }></i>
+                    </button>
+                    <button class="pb-btn" on:click=on_next_click><i class="btn-icon iconfont icon-xiayigexiayishou"></i></button>
+                    <button class="pb-btn pb-fav" class:active=is_favorited on:click=favorite_click>
+                        <i class="btn-icon iconfont icon-shoucang"></i>
+                    </button>
+                </div>
                 <div class="player-bar-time">{hint}</div>
                 <div class="player-bar-lyrics">
                     {move || {
@@ -645,17 +830,12 @@ pub fn PlayerBar(
                     type="range"
                     min="0"
                     max="100"
+                    style=bar_volume_style
                     prop:value=bar_volume_value
                     on:click=move |ev| ev.stop_propagation()
                     on:input=on_bar_volume
                 />
                 <AudioBars active=state.is_playing spectrum=state.spectrum />
-                <div class="player-bar-controls" on:click=move |ev| ev.stop_propagation()>
-                    <button class="pb-btn pb-fav" class:active=is_favorited on:click=favorite_click>
-                        <span class="btn-icon">"♡"</span>
-                    </button>
-                    <button class="pb-btn" on:click=on_play_click>{play_icon}</button>
-                </div>
             </div>
         </div>
     }
@@ -737,13 +917,6 @@ pub fn FullPlayer(
                 .any(|item| same_favorite_song(item, &song))
         })
     };
-    let play_icon = move || {
-        if state.is_playing.get() {
-            "暂停"
-        } else {
-            "播放"
-        }
-    };
     let album = move || {
         state
             .song_info
@@ -777,6 +950,12 @@ pub fn FullPlayer(
     let progress = move || format!("width:{}%", (state.progress.get() * 100.0).round());
     let thumb_left = move || format!("left:{}%", (state.progress.get() * 100.0).round());
     let volume_value = move || ((state.volume.get() * 100.0).round() as i32).to_string();
+    let volume_style = move || {
+        let value = (state.volume.get() * 100.0).round().clamp(0.0, 100.0);
+        format!(
+            "background:linear-gradient(to right,#39C5BB 0%,#39C5BB {value}%,rgba(255,255,255,0.18) {value}%,rgba(255,255,255,0.18) 100%);"
+        )
+    };
     let mode_label = move || match state.play_mode.get() {
         PlayMode::Sequential => "顺序",
         PlayMode::Shuffle => "随机",
@@ -829,7 +1008,6 @@ pub fn FullPlayer(
             } else if let Some(track) = current_track() {
                 if let Some(url) = track.url {
                     resume_or_play_url(&url);
-                    state.is_playing.set(true);
                 } else if let Some(index) = state.current_index.get() {
                     play_track_at(state.clone(), index, false);
                 }
@@ -893,6 +1071,64 @@ pub fn FullPlayer(
             }
         }
     };
+    let copy_link = {
+        let state = state.clone();
+        move |_| {
+            let url = current_track()
+                .and_then(|track| track.url)
+                .unwrap_or_default();
+            if url.is_empty() {
+                state.last_error.set(Some("暂无播放链接可复制".to_string()));
+                return;
+            }
+            if let Some(window) = web_sys::window() {
+                let _ = window.navigator().clipboard().write_text(&url);
+            }
+            state.last_error.set(Some("播放链接已复制".to_string()));
+        }
+    };
+    let download_current = {
+        let state = state.clone();
+        move |_| {
+            let Some(track) = current_track() else {
+                state.last_error.set(Some("暂无歌曲可下载".to_string()));
+                return;
+            };
+            let Some(url) = track.url.clone() else {
+                state.last_error.set(Some("暂无播放链接可下载".to_string()));
+                return;
+            };
+            let args = js_sys::Object::new();
+            let _ =
+                js_sys::Reflect::set(&args, &JsValue::from_str("url"), &JsValue::from_str(&url));
+            let _ = js_sys::Reflect::set(
+                &args,
+                &JsValue::from_str("title"),
+                &JsValue::from_str(&track.title),
+            );
+            let _ = js_sys::Reflect::set(
+                &args,
+                &JsValue::from_str("artist"),
+                &JsValue::from_str(&track.artist),
+            );
+            let _ = js_sys::Reflect::set(
+                &args,
+                &JsValue::from_str("format"),
+                &JsValue::from_str(track.format.as_deref().unwrap_or("mp3")),
+            );
+            let state = state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match invoke("download_song", Some(&args)).await {
+                    Ok(value) => state.last_error.set(Some(
+                        value.as_string().unwrap_or_else(|| "下载完成".to_string()),
+                    )),
+                    Err(error) => state.last_error.set(Some(
+                        error.as_string().unwrap_or_else(|| "下载失败".to_string()),
+                    )),
+                }
+            });
+        }
+    };
 
     let queue_state = state.clone();
     let queue_view = move || {
@@ -934,14 +1170,16 @@ pub fn FullPlayer(
                 <button class="fp-close" on:click=close_player>"关闭"</button>
 
                 <div class="fp-toolbar">
-                    <button class="fp-tool-btn" on:click=close_player><span class="btn-icon">"←"</span><span>"返回"</span></button>
-                    <button class="fp-tool-btn" class:active=move || state.show_lyrics.get() on:click=toggle_lyrics><span class="btn-icon">"≡"</span><span>"歌词"</span></button>
-                    <button class="fp-tool-btn" class:active=move || state.show_queue.get() on:click=toggle_queue><span class="btn-icon">"☰"</span><span>"队列"</span></button>
-                    <button class="fp-tool-btn" on:click=toggle_mode><span>{mode_label}</span></button>
+                    <button class="fp-tool-btn" on:click=close_player><i class="btn-icon iconfont icon-31fanhui1"></i><span>"返回"</span></button>
+                    <button class="fp-tool-btn" class:active=move || state.show_lyrics.get() on:click=toggle_lyrics><i class="btn-icon iconfont icon-geci"></i><span>"歌词"</span></button>
+                    <button class="fp-tool-btn" class:active=move || state.show_queue.get() on:click=toggle_queue><i class="btn-icon iconfont icon-gedan"></i><span>"队列"</span></button>
+                    <button class="fp-tool-btn" on:click=toggle_mode><i class="btn-icon iconfont icon-shunxubofang"></i><span>{mode_label}</span></button>
                     <button class="fp-tool-btn fp-fav-btn" class:active=is_favorited on:click=toggle_favorite>
-                        <span class="btn-icon">{move || if is_favorited() { "♥" } else { "♡" }}</span>
+                        <i class="btn-icon iconfont icon-shoucang"></i>
                         <span>{move || if is_favorited() { "已收藏" } else { "收藏" }}</span>
                     </button>
+                    <button class="fp-tool-btn" on:click=copy_link><i class="btn-icon iconfont icon-fuzhilianjie"></i><span>"复制链接"</span></button>
+                    <button class="fp-tool-btn" on:click=download_current><i class="btn-icon iconfont icon-xiazai"></i><span>"下载"</span></button>
                 </div>
 
                 <div class="fp-main-area">
@@ -959,7 +1197,7 @@ pub fn FullPlayer(
                                         }
                                     />
                                 </Show>
-                                <span class="fp-cover-icon">"♪"</span>
+                                <i class="fp-cover-icon iconfont icon-yinle1"></i>
                             </div>
                             <h1 class="fp-title">{title}</h1>
                             <p class="fp-artist">{artist}</p>
@@ -989,16 +1227,19 @@ pub fn FullPlayer(
                             </div>
 
                             <div class="fp-buttons">
-                                <button class="fp-btn" on:click=prev_handler>"上一首"</button>
-                                <button class="fp-btn fp-btn-play" on:click=toggle_play_handler>{play_icon}</button>
-                                <button class="fp-btn" on:click=next_handler>"下一首"</button>
+                                <button class="fp-btn" title="上一首" on:click=prev_handler><i class="btn-icon iconfont icon-shangyishoushangyige"></i></button>
+                                <button class="fp-btn fp-btn-play" on:click=toggle_play_handler>
+                                    <i class=move || if state.is_playing.get() { "btn-icon iconfont icon-zanting" } else { "btn-icon iconfont icon-bofang" }></i>
+                                </button>
+                                <button class="fp-btn" title="下一首" on:click=next_handler><i class="btn-icon iconfont icon-xiayigexiayishou"></i></button>
                                 <div class="fp-volume inline">
-                                    <span class="fp-vol-icon">"◔"</span>
+                                    <i class="fp-vol-icon iconfont icon-yinliang"></i>
                                     <input
                                         type="range"
                                         min="0"
                                         max="100"
                                         class="fp-volume-slider"
+                                        style=volume_style
                                         prop:value=volume_value
                                         on:input=on_volume
                                     />

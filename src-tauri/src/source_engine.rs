@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 const MAX_SEARCH_CONCURRENT: usize = 6;
 
+include!(concat!(env!("OUT_DIR"), "/embedded_sources.rs"));
+
 // ─── Source descriptor ───
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SourceInfo {
@@ -175,21 +177,56 @@ impl SourceEngine {
     pub fn scan_sources(&self) {
         let mut scanned = Vec::new();
 
-        if let Ok(entries) = fs::read_dir(&self.source_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().map_or(false, |e| e == "js") {
-                    let file_name = path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+        println!(
+            "[scan_sources] EMBEDDED_SOURCES has {} entries",
+            EMBEDDED_SOURCES.len()
+        );
 
-                    // Parse JS file for metadata
-                    let (name, meta) = parse_source_file(&path, 0, &file_name);
-                    scanned.push((file_name, name, meta));
+        for (file_name, content) in EMBEDDED_SOURCES.iter().copied() {
+            let stem = std::path::Path::new(file_name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let (name, meta) = parse_source_content(content, &stem);
+            scanned.push((stem, name, meta));
+        }
+
+        println!("[scan_sources] After embedded: {} entries", scanned.len());
+
+        if scanned.is_empty() {
+            println!(
+                "[scan_sources] EMBEDDED_SOURCES empty, falling back to physical dir: {:?}",
+                self.source_dir
+            );
+            if let Ok(entries) = fs::read_dir(&self.source_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().map_or(false, |e| e == "js") {
+                        let file_name = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+
+                        // Parse JS file for metadata
+                        let (name, meta) = parse_source_file(&path, 0, &file_name);
+                        scanned.push((file_name, name, meta));
+                    }
                 }
+                println!("[scan_sources] Physical dir: {} entries", scanned.len());
+            } else {
+                println!("[scan_sources] Failed to read physical dir");
             }
+        }
+
+        if !scanned
+            .iter()
+            .any(|(file_name, _, _)| file_name.eq_ignore_ascii_case("xiaowo"))
+        {
+            let (_, meta) = parse_source_content("", "xiaowo");
+            scanned.insert(0, ("xiaowo".to_string(), "xiaowo".to_string(), meta));
+            println!("[scan_sources] xiaowo adapter inserted at top");
         }
 
         scanned.sort_by(|left, right| left.0.cmp(&right.0));
@@ -208,6 +245,12 @@ impl SourceEngine {
                 meta_map.insert(id, meta);
             }
         }
+
+        println!(
+            "[scan_sources] Final: {} sources, {} with meta (api)",
+            sources.len(),
+            meta_map.len()
+        );
 
         if let Ok(mut current) = self.sources.lock() {
             *current = sources;
@@ -499,7 +542,7 @@ impl SourceEngine {
         let mut results = Vec::new();
         for task in tasks {
             // Add per-task timeout so slow sources don't block everything
-            match tokio::time::timeout(std::time::Duration::from_secs(6), task).await {
+            match tokio::time::timeout(std::time::Duration::from_secs(3), task).await {
                 Ok(Ok((id, name, items))) => {
                     println!("Source {}: found {} hot keywords", name, items.len());
                     for item in items {
@@ -520,6 +563,46 @@ impl SourceEngine {
             // Return early if we have enough results
             if results.len() >= limit * 2 {
                 break;
+            }
+        }
+
+        if results.is_empty() {
+            let metas = self.meta_map.lock().unwrap().clone();
+            for (id, meta) in metas {
+                if !matches!(meta.adapter, Some(NativeSourceAdapter::Xiaowo)) {
+                    continue;
+                }
+                let client = self.http_client.clone();
+                if let Ok(rankings) = tokio::time::timeout(
+                    Duration::from_secs(3),
+                    fetch_xiaowo_rankings(&client, id, &meta.name),
+                )
+                .await
+                {
+                    for ranking in rankings.into_iter().take(2) {
+                        if let Ok(songs) = tokio::time::timeout(
+                            Duration::from_secs(4),
+                            fetch_xiaowo_ranking_songs(&client, id, &ranking.id),
+                        )
+                        .await
+                        {
+                            for song in songs.into_iter().take(limit.saturating_sub(results.len()))
+                            {
+                                results.push(HotItem {
+                                    title: song.title,
+                                    source: meta.name.clone(),
+                                    source_id: id,
+                                });
+                            }
+                        }
+                        if results.len() >= limit {
+                            break;
+                        }
+                    }
+                }
+                if results.len() >= limit {
+                    break;
+                }
             }
         }
 
@@ -562,12 +645,17 @@ impl SourceEngine {
             };
             let client = client.clone();
             tasks.push(tokio::spawn(async move {
-                match meta.adapter {
-                    Some(NativeSourceAdapter::Xiaowo) => {
-                        fetch_xiaowo_rankings(&client, source.id, &meta.name).await
+                let fetch = async {
+                    match meta.adapter {
+                        Some(NativeSourceAdapter::Xiaowo) => {
+                            fetch_xiaowo_rankings(&client, source.id, &meta.name).await
+                        }
+                        None => fetch_rankings(&client, &meta, source.id).await,
                     }
-                    None => fetch_rankings(&client, &meta, source.id).await,
-                }
+                };
+                tokio::time::timeout(Duration::from_secs(4), fetch)
+                    .await
+                    .unwrap_or_default()
             }));
         }
 
@@ -634,12 +722,17 @@ impl SourceEngine {
             };
             let client = client.clone();
             tasks.push(tokio::spawn(async move {
-                match meta.adapter {
-                    Some(NativeSourceAdapter::Xiaowo) => {
-                        fetch_xiaowo_playlists(&client, source.id, &meta.name).await
+                let fetch = async {
+                    match meta.adapter {
+                        Some(NativeSourceAdapter::Xiaowo) => {
+                            fetch_xiaowo_playlists(&client, source.id, &meta.name).await
+                        }
+                        None => fetch_playlists(&client, &meta, source.id).await,
                     }
-                    None => fetch_playlists(&client, &meta, source.id).await,
-                }
+                };
+                tokio::time::timeout(Duration::from_secs(4), fetch)
+                    .await
+                    .unwrap_or_default()
             }));
         }
 
@@ -705,10 +798,46 @@ impl SourceEngine {
             None => return None,
         };
         let client = self.http_client.clone();
-        match meta.adapter {
+        let mut result = match meta.adapter {
             Some(NativeSourceAdapter::Xiaowo) => fetch_xiaowo_song_info(&client, song_id).await,
             None => fetch_song_info(&client, &meta, source_id, platform, song_id).await,
+        };
+        if platform == "kw"
+            && result.as_ref().is_none_or(|info| {
+                info.lyrics
+                    .as_deref()
+                    .is_none_or(|lyrics| lyrics.trim().is_empty())
+            })
+        {
+            if let Some(kuwo_info) = fetch_xiaowo_song_info(&client, song_id).await {
+                if let Some(info) = result.as_mut() {
+                    if info
+                        .lyrics
+                        .as_deref()
+                        .is_none_or(|lyrics| lyrics.trim().is_empty())
+                    {
+                        info.lyrics = kuwo_info.lyrics.clone();
+                    }
+                    if info
+                        .cover_url
+                        .as_deref()
+                        .is_none_or(|cover| cover.trim().is_empty())
+                    {
+                        info.cover_url = kuwo_info.cover_url.clone();
+                    }
+                    if info
+                        .album
+                        .as_deref()
+                        .is_none_or(|album| album.trim().is_empty())
+                    {
+                        info.album = kuwo_info.album.clone();
+                    }
+                } else {
+                    result = Some(kuwo_info);
+                }
+            }
         }
+        result
     }
 }
 
@@ -727,10 +856,14 @@ fn parse_source_file(
         }
     };
 
-    let name = extract_source_name(&content).unwrap_or_else(|| file_name.to_string());
-    let api_url = extract_js_var(&content, "API_URL").map(|s| s.trim_matches('"').to_string());
-    let api_key = extract_js_var(&content, "API_KEY").map(|s| s.trim_matches('"').to_string());
-    let quality_str = extract_js_var(&content, "MUSIC_QUALITY");
+    parse_source_content(&content, file_name)
+}
+
+fn parse_source_content(content: &str, file_name: &str) -> (String, Option<SourceMeta>) {
+    let name = extract_source_name(content).unwrap_or_else(|| file_name.to_string());
+    let api_url = extract_js_var(content, "API_URL").map(|s| s.trim_matches('"').to_string());
+    let api_key = extract_js_var(content, "API_KEY").map(|s| s.trim_matches('"').to_string());
+    let quality_str = extract_js_var(content, "MUSIC_QUALITY");
 
     let platforms = quality_str
         .and_then(|s| {
@@ -1301,55 +1434,12 @@ async fn fetch_xiaowo_song_info(client: &reqwest::Client, song_id: &str) -> Opti
         None => fetch_kuwo_cover(client, song_id).await,
     };
 
-    let lyrics = data
-        .get("lrclist")
-        .or_else(|| data.get("lrcList"))
-        .or_else(|| data.get("lyrics"))
-        .and_then(|value| {
-            if let Some(text) = value.as_str() {
-                return Some(text.to_string());
-            }
-            value.as_array().map(|items| {
-                items
-                    .iter()
-                    .filter_map(|item| {
-                        let text = item
-                            .get("lineLyric")
-                            .or_else(|| item.get("lyric"))
-                            .or_else(|| item.get("text"))
-                            .and_then(|value| value.as_str())?
-                            .trim();
-                        if text.is_empty() {
-                            return None;
-                        }
-                        let time = item
-                            .get("time")
-                            .or_else(|| item.get("lineTime"))
-                            .or_else(|| item.get("startTime"))
-                            .map(json_value_to_string)
-                            .unwrap_or_default();
-                        if time.contains(':') {
-                            Some(format!("[{}]{}", time.trim_matches(['[', ']']), text))
-                        } else if let Ok(seconds) = time.parse::<f64>() {
-                            let minutes = (seconds / 60.0).floor() as u32;
-                            let secs = seconds - (minutes as f64 * 60.0);
-                            Some(format!("[{:02}:{:05.2}]{}", minutes, secs, text))
-                        } else {
-                            Some(text.to_string())
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
-            })
-        })
-        .or_else(|| {
-            data.get("lrc")
-                .or_else(|| data.get("lyric"))
-                .or_else(|| data.get("lyricText"))
-                .and_then(|value| value.as_str())
-                .map(|value| value.to_string())
-        })
+    let mut lyrics = extract_kuwo_lyrics_from_json(data)
+        .or_else(|| extract_kuwo_lyrics_from_json(song))
         .filter(|value| !value.is_empty());
+    if lyrics.is_none() {
+        lyrics = fetch_kuwo_lyrics(client, song_id).await;
+    }
 
     Some(SongInfoResult {
         id: song_id.to_string(),
@@ -1371,6 +1461,168 @@ async fn fetch_xiaowo_song_info(client: &reqwest::Client, song_id: &str) -> Opti
         duration: None,
         platform: "kw".to_string(),
     })
+}
+
+async fn fetch_kuwo_lyrics(client: &reqwest::Client, song_id: &str) -> Option<String> {
+    for (url, id_key, referer) in [
+        (
+            "http://www.kuwo.cn/newh5/singles/songinfoandlrc",
+            "musicId",
+            "http://www.kuwo.cn/",
+        ),
+        (
+            "http://m.kuwo.cn/newh5/singles/songinfoandlrc",
+            "mid",
+            "http://m.kuwo.cn/",
+        ),
+        (
+            "http://m.kuwo.cn/newh5/singles/songinfoandlrc",
+            "musicId",
+            "http://m.kuwo.cn/",
+        ),
+    ] {
+        let Ok(response) = client
+            .get(url)
+            .query(&[(id_key, song_id), ("httpStatus", "1"), ("httpsStatus", "1")])
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            )
+            .header("Referer", referer)
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        if let Ok(json) = response.json::<serde_json::Value>().await {
+            if let Some(lyrics) = extract_kuwo_lyrics_from_json(&json) {
+                if !lyrics.trim().is_empty() {
+                    return Some(lyrics);
+                }
+            }
+        }
+    }
+    for url in [
+        format!(
+            "https://www.kuwo.cn/openapi/v1/www/lyric/getlyric?musicId={song_id}&httpsStatus=1"
+        ),
+        format!("https://m.kuwo.cn/newh5/singles/songinfoandlrc?musicId={song_id}&httpsStatus=1"),
+        format!("https://m.kuwo.cn/newh5/singles/songinfoandlrc?mid={song_id}&httpsStatus=1"),
+    ] {
+        let Ok(response) = client
+            .get(&url)
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            )
+            .header("Referer", "https://www.kuwo.cn/")
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await
+        else {
+            continue;
+        };
+        let Ok(text) = response.text().await else {
+            continue;
+        };
+        if let Some(lyrics) = parse_json_or_jsonp_lyrics(&text) {
+            if !lyrics.trim().is_empty() {
+                return Some(lyrics);
+            }
+        }
+    }
+    None
+}
+
+fn parse_json_or_jsonp_lyrics(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    let json_text = if trimmed.starts_with('{') || trimmed.starts_with('[') {
+        trimmed
+    } else {
+        let start = trimmed.find(['{', '['])?;
+        let end = trimmed.rfind(['}', ']'])?;
+        &trimmed[start..=end]
+    };
+    serde_json::from_str::<serde_json::Value>(json_text)
+        .ok()
+        .and_then(|value| extract_kuwo_lyrics_from_json(&value))
+}
+
+fn extract_kuwo_lyrics_from_json(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        }
+        serde_json::Value::Array(items) => {
+            let lines = items
+                .iter()
+                .filter_map(kuwo_lyric_line_from_item)
+                .collect::<Vec<_>>();
+            if !lines.is_empty() {
+                return Some(lines.join("\n"));
+            }
+            items.iter().find_map(extract_kuwo_lyrics_from_json)
+        }
+        serde_json::Value::Object(map) => {
+            for key in [
+                "lrclist",
+                "lrcList",
+                "lyrics",
+                "lrc",
+                "lyric",
+                "lyricText",
+                "content",
+            ] {
+                if let Some(found) = map.get(key).and_then(extract_kuwo_lyrics_from_json) {
+                    return Some(found);
+                }
+            }
+            if let Some(line) = kuwo_lyric_line_from_item(value) {
+                return Some(line);
+            }
+            for key in ["data", "songinfo", "songInfo", "musicInfo", "song"] {
+                if let Some(found) = map.get(key).and_then(extract_kuwo_lyrics_from_json) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn kuwo_lyric_line_from_item(value: &serde_json::Value) -> Option<String> {
+    let text = value
+        .get("lineLyric")
+        .or_else(|| value.get("lyric"))
+        .or_else(|| value.get("text"))
+        .or_else(|| value.get("content"))
+        .and_then(|value| value.as_str())?
+        .trim();
+    if text.is_empty() {
+        return None;
+    }
+    let time = value
+        .get("time")
+        .or_else(|| value.get("lineTime"))
+        .or_else(|| value.get("startTime"))
+        .map(json_value_to_string)
+        .unwrap_or_default();
+    if time.contains(':') {
+        Some(format!("[{}]{}", time.trim_matches(['[', ']']), text))
+    } else if let Ok(seconds) = time.parse::<f64>() {
+        let minutes = (seconds / 60.0).floor() as u32;
+        let secs = seconds - (minutes as f64 * 60.0);
+        Some(format!("[{:02}:{:05.2}]{}", minutes, secs, text))
+    } else {
+        Some(text.to_string())
+    }
 }
 
 async fn fetch_xiaowo_rankings(
@@ -1610,7 +1862,13 @@ fn xiaowo_song_detail_from_item(
             .get("duration")
             .or_else(|| item.get("songTimeMinutes"))
             .and_then(json_value_to_f64)
-            .map(|value| if value > 10000.0 { value / 1000.0 } else { value }),
+            .map(|value| {
+                if value > 10000.0 {
+                    value / 1000.0
+                } else {
+                    value
+                }
+            }),
         source_id,
         platform: "kw".to_string(),
     })
@@ -2733,6 +2991,8 @@ async fn fetch_song_info(
 }
 
 pub async fn parse_kugou_shared_playlist(url: &str) -> Result<SharedPlaylist, String> {
+    let normalized_url = normalize_share_url(url)
+        .ok_or_else(|| "没有找到可解析的酷狗歌单链接，请粘贴完整分享链接或接口内容".to_string())?;
     let client = reqwest::Client::builder()
         .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
         .redirect(reqwest::redirect::Policy::limited(10))
@@ -2741,7 +3001,7 @@ pub async fn parse_kugou_shared_playlist(url: &str) -> Result<SharedPlaylist, St
         .map_err(|err| err.to_string())?;
 
     let text = client
-        .get(url)
+        .get(&normalized_url)
         .send()
         .await
         .map_err(|err| format!("分享链接访问失败: {err}"))?
@@ -2750,16 +3010,40 @@ pub async fn parse_kugou_shared_playlist(url: &str) -> Result<SharedPlaylist, St
         .map_err(|err| format!("分享内容读取失败: {err}"))?;
 
     let title = extract_html_title(&text).unwrap_or_else(|| "酷狗分享歌单".to_string());
-    let songs = extract_kugou_songs_from_text(&text);
+    let mut songs = extract_kugou_songs_from_text(&text);
+    if songs.is_empty() {
+        for nested_url in extract_kugou_urls(&text)
+            .into_iter()
+            .chain(kugou_playlist_candidate_urls(&normalized_url, &text))
+        {
+            if nested_url == normalized_url {
+                continue;
+            }
+            if let Ok(response) = client.get(&nested_url).send().await {
+                if let Ok(nested_text) = response.text().await {
+                    songs = extract_kugou_songs_from_text(&nested_text);
+                    if !songs.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
+    }
     let note = if songs.is_empty() {
         Some("已收藏分享链接，但当前接口没有返回可解析的歌曲列表。".to_string())
     } else {
         None
     };
 
+    let note = if songs.is_empty() {
+        Some("已识别酷狗歌单链接，但页面和公开接口都没有返回可解析歌曲。请确认链接不是私密歌单，或重新复制完整分享链接。".to_string())
+    } else {
+        note
+    };
+
     Ok(SharedPlaylist {
         playlist: PlaylistInfo {
-            id: url.to_string(),
+            id: normalized_url.clone(),
             name: title,
             cover: extract_first_image(&text),
             song_count: Some(songs.len()),
@@ -2767,7 +3051,7 @@ pub async fn parse_kugou_shared_playlist(url: &str) -> Result<SharedPlaylist, St
             source_name: "酷狗分享".to_string(),
         },
         songs,
-        external_url: url.to_string(),
+        external_url: normalized_url,
         note,
     })
 }
@@ -2783,6 +3067,25 @@ fn extract_html_title(text: &str) -> Option<String> {
         .trim()
         .to_string();
     (!title.is_empty()).then_some(title)
+}
+
+fn normalize_share_url(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    let mut url = extract_url_like(trimmed).unwrap_or_else(|| trimmed.to_string());
+    url = url
+        .trim()
+        .trim_matches(|ch| {
+            matches!(
+                ch,
+                '"' | '\'' | '`' | '<' | '>' | ')' | ']' | '}' | '，' | '。'
+            )
+        })
+        .to_string();
+    if url.starts_with("http://") || url.starts_with("https://") {
+        Some(decode_basic_html(&url).replace("\\/", "/"))
+    } else {
+        None
+    }
 }
 
 fn extract_first_image(text: &str) -> Option<String> {
@@ -2801,9 +3104,37 @@ fn extract_url_like(text: &str) -> Option<String> {
     let start = text.find("http")?;
     let rest = &text[start..];
     let end = rest
-        .find(|ch: char| ch == '"' || ch == '\'' || ch.is_whitespace() || ch == '<')
+        .find(|ch: char| {
+            ch == '"'
+                || ch == '\''
+                || ch == '`'
+                || ch.is_whitespace()
+                || ch == '<'
+                || ch == ')'
+                || ch == ']'
+        })
         .unwrap_or(rest.len());
-    Some(decode_basic_html(&rest[..end]))
+    Some(decode_basic_html(&rest[..end]).replace("\\/", "/"))
+}
+
+fn extract_kugou_urls(text: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    let mut rest = text;
+    while let Some(pos) = rest.find("http") {
+        if let Some(candidate) = extract_url_like(&rest[pos..]) {
+            if candidate.contains("kugou.com")
+                || candidate.contains("pubsongscdn.kugou.com")
+                || candidate.contains("t1.kugou.com")
+            {
+                let url = decode_basic_html(candidate.trim_matches(['\\', '"', '\'']));
+                if !urls.contains(&url) {
+                    urls.push(url);
+                }
+            }
+        }
+        rest = &rest[pos + 4..];
+    }
+    urls
 }
 
 fn decode_basic_html(value: &str) -> String {
@@ -2811,25 +3142,104 @@ fn decode_basic_html(value: &str) -> String {
         .replace("&amp;", "&")
         .replace("&quot;", "\"")
         .replace("&#39;", "'")
+        .replace("&#x27;", "'")
+        .replace("&#x2F;", "/")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
 }
 
+fn kugou_playlist_candidate_urls(input_url: &str, text: &str) -> Vec<String> {
+    let mut urls = Vec::new();
+    for url in extract_kugou_urls(text) {
+        push_unique(&mut urls, url);
+    }
+    for gcid in extract_gcid_values(input_url)
+        .into_iter()
+        .chain(extract_gcid_values(text))
+    {
+        push_unique(
+            &mut urls,
+            format!("https://www.kugou.com/songlist/{gcid}/?src_cid={gcid}"),
+        );
+    }
+    for collection_id in extract_collection_ids(text)
+        .into_iter()
+        .chain(extract_collection_ids(input_url))
+    {
+        push_unique(
+            &mut urls,
+            format!(
+                "https://pubsongscdn.kugou.com/v2/get_other_list_file?srcappid=2919&clientver=20000&clienttime=1780992177049&mid=1fb95e3ddf2a3557b2c5ba9dff1d6186&uuid=1780992177049&dfid=1u0bY23Rg3184bpf3n37fOPQ&appid=1058&type=0&module=playlist&page=1&pagesize=500&global_collection_id={collection_id}"
+            ),
+        );
+    }
+    urls
+}
+
+fn push_unique(values: &mut Vec<String>, value: String) {
+    if !value.trim().is_empty() && !values.contains(&value) {
+        values.push(value);
+    }
+}
+
+fn extract_gcid_values(text: &str) -> Vec<String> {
+    extract_token_values(text, "gcid_", |ch| ch.is_ascii_alphanumeric() || ch == '_')
+        .into_iter()
+        .map(|suffix| format!("gcid_{suffix}"))
+        .collect()
+}
+
+fn extract_collection_ids(text: &str) -> Vec<String> {
+    extract_token_values(text, "collection_", |ch| {
+        ch.is_ascii_alphanumeric() || ch == '_'
+    })
+    .into_iter()
+    .map(|suffix| format!("collection_{suffix}"))
+    .collect()
+}
+
+fn extract_token_values<F>(text: &str, prefix: &str, keep: F) -> Vec<String>
+where
+    F: Fn(char) -> bool,
+{
+    let decoded = decode_basic_html(text).replace("\\/", "/");
+    let mut values = Vec::new();
+    let mut rest = decoded.as_str();
+    while let Some(pos) = rest.find(prefix) {
+        let tail = &rest[pos + prefix.len()..];
+        let token: String = tail.chars().take_while(|ch| keep(*ch)).collect();
+        let step = token.len().min(tail.len()).max(1);
+        if !token.is_empty() && !values.contains(&token) {
+            values.push(token);
+        }
+        rest = &tail[step..];
+    }
+    values
+}
+
 fn extract_kugou_songs_from_text(text: &str) -> Vec<SongDetail> {
     let mut out = Vec::new();
-    if let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) {
-        collect_song_details(&value, &mut out);
-    }
-    if let Some(value) = extract_assigned_json(text, "var nData") {
-        collect_song_details(&value, &mut out);
-    }
-    if let Some(value) = extract_assigned_json(text, "nData") {
-        collect_song_details(&value, &mut out);
-    }
-    for value in collect_json_values(text) {
-        collect_song_details(&value, &mut out);
-        if out.len() >= 300 {
-            break;
+    let decoded = decode_basic_html(text).replace("\\/", "/");
+    for candidate_text in [text, decoded.as_str()] {
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(candidate_text.trim()) {
+            collect_song_details(&value, &mut out);
+        }
+        for marker in [
+            "var nData",
+            "nData",
+            "window.__INITIAL_STATE__",
+            "window.__INITIAL_DATA__",
+            "__NUXT__",
+        ] {
+            if let Some(value) = extract_assigned_json(candidate_text, marker) {
+                collect_song_details(&value, &mut out);
+            }
+        }
+        for value in collect_json_values(candidate_text) {
+            collect_song_details(&value, &mut out);
+            if out.len() >= 500 {
+                break;
+            }
         }
     }
     dedupe_song_details(out)
@@ -2856,9 +3266,15 @@ fn collect_json_values(text: &str) -> Vec<serde_json::Value> {
     let mut values = Vec::new();
     for marker in [
         "window.__INITIAL_STATE__=",
+        "window.__INITIAL_DATA__=",
         "__NUXT__=",
         "var nData",
+        "\"data\"",
+        "\"info\"",
+        "\"listinfo\"",
+        "\"global_collection_id\"",
         "songs",
+        "\"songs\"",
         "list",
     ] {
         let Some(pos) = text.find(marker) else {
@@ -2928,8 +3344,40 @@ fn collect_song_details(value: &serde_json::Value, out: &mut Vec<SongDetail>) {
 }
 
 fn song_detail_from_json(value: &serde_json::Value) -> Option<SongDetail> {
-    let title = first_str(value, &["songname", "song_name", "name", "title"])?;
-    let artist = first_str(
+    let song_like = [
+        "hash",
+        "audio_id",
+        "songid",
+        "song_id",
+        "filename",
+        "fileName",
+        "timelen",
+        "time_len",
+        "duration",
+        "download",
+        "relate_goods",
+        "song_url",
+        "albuminfo",
+    ]
+    .iter()
+    .any(|key| value.get(*key).is_some());
+    if !song_like {
+        return None;
+    }
+    let raw_title = first_str(
+        value,
+        &[
+            "songname",
+            "song_name",
+            "audio_name",
+            "filename",
+            "fileName",
+            "name",
+            "title",
+        ],
+    )?;
+    let mut title = raw_title.clone();
+    let mut artist = first_str(
         value,
         &[
             "singername",
@@ -2937,9 +3385,30 @@ fn song_detail_from_json(value: &serde_json::Value) -> Option<SongDetail> {
             "author_name",
             "artist",
             "singer",
+            "singers",
+            "singerinfo",
+            "singerInfo",
         ],
     )
     .unwrap_or_else(|| "未知歌手".to_string());
+    if (artist.is_empty() || artist == "未知歌手") && raw_title.contains(" - ") {
+        let mut parts = raw_title.splitn(2, " - ");
+        if let (Some(left), Some(right)) = (parts.next(), parts.next()) {
+            if !left.trim().is_empty() && !right.trim().is_empty() {
+                artist = left.trim().to_string();
+                title = right.trim().to_string();
+            }
+        }
+    }
+    if title.contains(" - ") {
+        let current_title = title.clone();
+        let mut parts = current_title.splitn(2, " - ");
+        if let (Some(left), Some(right)) = (parts.next(), parts.next()) {
+            if artist == left.trim() && !right.trim().is_empty() {
+                title = right.trim().to_string();
+            }
+        }
+    }
     let id = first_str(value, &["hash", "audio_id", "songid", "song_id", "id"])
         .unwrap_or_else(|| format!("kg-share-{}-{}", title, artist));
     if title.len() > 80 || title.contains("http") {
@@ -2951,7 +3420,19 @@ fn song_detail_from_json(value: &serde_json::Value) -> Option<SongDetail> {
         artist,
         album: first_str(value, &["album_name", "album", "albumname"]),
         album_id: first_str(value, &["album_id", "albumid"]),
-        cover_url: first_str(value, &["img", "image", "cover", "pic"]),
+        cover_url: first_str(
+            value,
+            &[
+                "img",
+                "image",
+                "cover",
+                "pic",
+                "album_img",
+                "albumimg",
+                "sizable_cover",
+            ],
+        )
+        .map(normalize_kugou_cover_url),
         duration: first_f64(value, &["duration", "time_len", "timelen"]).map(|d| {
             if d > 10000.0 {
                 d / 1000.0
@@ -2967,13 +3448,22 @@ fn song_detail_from_json(value: &serde_json::Value) -> Option<SongDetail> {
 fn first_str(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .find_map(|key| value.get(*key))
-        .and_then(|value| {
-            value
-                .as_str()
-                .map(ToString::to_string)
-                .or_else(|| value.as_i64().map(|v| v.to_string()))
-        })
+        .map(json_value_to_string)
         .filter(|value| !value.trim().is_empty())
+}
+
+fn normalize_kugou_cover_url(value: String) -> String {
+    let mut url = value
+        .replace("{size}", "400")
+        .replace("{SIZE}", "400")
+        .trim()
+        .to_string();
+    if url.starts_with("//") {
+        url = format!("https:{url}");
+    } else if url.starts_with("http://") {
+        url = url.replacen("http://", "https://", 1);
+    }
+    url
 }
 
 fn first_f64(value: &serde_json::Value, keys: &[&str]) -> Option<f64> {
@@ -2988,4 +3478,68 @@ fn dedupe_song_details(songs: Vec<SongDetail>) -> Vec<SongDetail> {
         .into_iter()
         .filter(|song| seen.insert(format!("{}::{}", song.title, song.artist)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_kugou_concept_playlist_json() {
+        let text = r#"{
+            "data": {
+                "info": [{
+                    "hash": "95014B8A1544E30110B1663549BAD271",
+                    "audio_id": 56390512,
+                    "name": "Sasha Alex Sloan - Dancing With Your Ghost",
+                    "timelen": 198000,
+                    "albuminfo": {"name": "Dancing With Your Ghost"},
+                    "singerinfo": [{"name": "Sasha Alex Sloan"}],
+                    "cover": "http:\/\/imge.kugou.com\/stdmusic\/{size}\/cover.jpg"
+                }]
+            }
+        }"#;
+        let songs = extract_kugou_songs_from_text(text);
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].title, "Dancing With Your Ghost");
+        assert_eq!(songs[0].artist, "Sasha Alex Sloan");
+        assert_eq!(songs[0].duration, Some(198.0));
+        assert!(songs[0]
+            .cover_url
+            .as_deref()
+            .unwrap_or_default()
+            .starts_with("https://"));
+    }
+
+    #[test]
+    fn parses_kugou_html_ndata_songs() {
+        let text = r#"<script>
+            var nData = {
+                "listinfo": {
+                    "global_collection_id": "collection_3_1488927378_18_0",
+                    "encode_gcid": "gcid_3zsc75w8ziz07c"
+                },
+                "songs": [{
+                    "hash": "284017622B0A01117DF25019176BCCA7",
+                    "audio_id": 571602467,
+                    "name": "\u7b11\u5929\u5199\u610f - \u5c3d\u529b\u4e86\u5c31\u662f\u5706\u6ee1",
+                    "timelen": 243000,
+                    "singerinfo": [{"name": "\u7b11\u5929\u5199\u610f"}],
+                    "cover": "http:\/\/imge.kugou.com\/stdmusic\/{size}\/20260509.jpg"
+                }]
+            };
+        </script>"#;
+        let songs = extract_kugou_songs_from_text(text);
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].artist, "笑天写意");
+        assert_eq!(songs[0].title, "尽力了就是圆满");
+    }
+
+    #[test]
+    fn extracts_url_from_pasted_label() {
+        assert_eq!(
+            normalize_share_url("Link https://www.kugou.com/songlist/gcid_abc/?x=1").as_deref(),
+            Some("https://www.kugou.com/songlist/gcid_abc/?x=1")
+        );
+    }
 }

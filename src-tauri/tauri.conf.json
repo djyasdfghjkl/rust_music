@@ -6,7 +6,6 @@
   "build": {
     "beforeDevCommand": "cd /d D:\\code\\music\\music-tauri\\ui && trunk serve",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "cd /d D:\\code\\music\\music-tauri\\ui && trunk build",
     "frontendDist": "../ui/dist"
   },
   "app": {
