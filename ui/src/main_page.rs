@@ -93,7 +93,7 @@ impl SearchSortMode {
     }
 }
 
-const FAVORITES_KEY: &str = "miku_tunes_favorites_v1";
+const LEGACY_FAVORITES_KEY: &str = "miku_tunes_favorites_v1";
 #[component]
 pub fn MainPage() -> impl IntoView {
     let current_page = RwSignal::new(Page::Home);
@@ -118,7 +118,7 @@ pub fn MainPage() -> impl IntoView {
     let debounce_token = RwSignal::new(0_u64);
     let ime_composing = RwSignal::new(false);
 
-    let favorites = RwSignal::new(load_favorites());
+    let favorites = RwSignal::new(FavoritesData::default());
     let shared_playlist = RwSignal::new(Option::<SharedPlaylist>::None);
     let shared_loading = RwSignal::new(false);
     let shared_error = RwSignal::new(Option::<String>::None);
@@ -135,6 +135,27 @@ pub fn MainPage() -> impl IntoView {
     let orb_moved = RwSignal::new(false);
     let player_state = PlayerState::new();
     setup_audio_events(player_state.clone());
+    setup_download_events(player_state.clone());
+
+    {
+        let favorites = favorites.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let loaded = invoke("load_favorites", None)
+                .await
+                .ok()
+                .and_then(|value| serde_wasm_bindgen::from_value::<FavoritesData>(value).ok())
+                .unwrap_or_default();
+            if favorites_is_empty(&loaded) {
+                let legacy = load_legacy_favorites();
+                if !favorites_is_empty(&legacy) {
+                    favorites.set(legacy.clone());
+                    persist_favorites(&legacy);
+                    return;
+                }
+            }
+            favorites.set(loaded);
+        });
+    }
 
     {
         let search_results = search_results.clone();
@@ -175,7 +196,7 @@ pub fn MainPage() -> impl IntoView {
             } else {
                 data.songs.insert(0, song);
             }
-            save_favorites(&data);
+            persist_favorites(&data);
             favorites.set(data);
         })
     };
@@ -192,7 +213,7 @@ pub fn MainPage() -> impl IntoView {
                 } else {
                     data.playlists.insert(0, playlist);
                 }
-                save_favorites(&data);
+                persist_favorites(&data);
                 favorites.set(data);
             })
         };
@@ -207,7 +228,7 @@ pub fn MainPage() -> impl IntoView {
                 .any(|item| same_song_favorite(item, &song))
             {
                 data.songs.insert(0, song);
-                save_favorites(&data);
+                persist_favorites(&data);
                 favorites.set(data);
             }
         })
@@ -1941,7 +1962,7 @@ fn render_favorites_view(
         <section class="section favorites-page">
             <div class="section-header">
                 <h2 class="section-title">"我的收藏"</h2>
-                <span class="section-more">"缓存保存在本地，删除缓存后收藏会失效"</span>
+                <span class="section-more">"收藏会优先保存在应用同级目录的 MikuTunesData/favorites.json"</span>
             </div>
             <div class="favorites-grid">
                 <section class="home-shelf">
@@ -2008,48 +2029,60 @@ fn SettingsView(
     let download_path = RwSignal::new("系统下载目录 / MikuTunes".to_string());
     let preferred_quality = RwSignal::new("320k 优先".to_string());
     let lyric_translate = RwSignal::new(false);
-    let download_drives = RwSignal::new(Vec::<String>::new());
     let download_status = RwSignal::new(String::new());
     {
         let download_path = download_path.clone();
-        let download_drives = download_drives.clone();
         wasm_bindgen_futures::spawn_local(async move {
             if let Ok(value) = invoke("get_download_dir", None).await {
                 if let Some(path) = value.as_string() {
                     download_path.set(path);
                 }
             }
-            if let Ok(value) = invoke("list_windows_drives", None).await {
-                if let Ok(drives) = serde_wasm_bindgen::from_value::<Vec<String>>(value) {
-                    download_drives.set(drives);
-                }
-            }
         });
     }
-    let save_download_path = {
+    let pick_download_path = {
+        let download_path = download_path.clone();
+        let download_status = download_status.clone();
+        move |_| {
+            download_status.set("正在打开文件夹选择器...".to_string());
+            let download_path = download_path.clone();
+            let download_status = download_status.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match invoke("pick_download_dir", None).await {
+                    Ok(value) => {
+                        if value.is_null() || value.is_undefined() {
+                            download_status.set("未更改下载位置".to_string());
+                            return;
+                        }
+                        if let Ok(saved) = serde_wasm_bindgen::from_value::<Option<String>>(value) {
+                            if let Some(path) = saved {
+                                download_path.set(path);
+                                download_status.set("下载位置已更新".to_string());
+                            } else {
+                                download_status.set("未更改下载位置".to_string());
+                            }
+                        }
+                    }
+                    Err(err) => download_status
+                        .set(err.as_string().unwrap_or_else(|| "选择文件夹失败".to_string())),
+                }
+            });
+        }
+    };
+    let reveal_download_dir = {
         let download_path = download_path.clone();
         let download_status = download_status.clone();
         move |_| {
             let path = download_path.get();
-            download_status.set("正在保存...".to_string());
-            let download_path = download_path.clone();
+            let args = js_sys::Object::new();
+            let _ =
+                js_sys::Reflect::set(&args, &JsValue::from_str("path"), &JsValue::from_str(&path));
             let download_status = download_status.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                let args = js_sys::Object::new();
-                let _ = js_sys::Reflect::set(
-                    &args,
-                    &JsValue::from_str("path"),
-                    &JsValue::from_str(&path),
-                );
-                match invoke("set_download_dir", Some(&args)).await {
-                    Ok(value) => {
-                        if let Some(saved) = value.as_string() {
-                            download_path.set(saved);
-                        }
-                        download_status.set("已保存".to_string());
-                    }
+                match invoke("reveal_in_folder", Some(&args)).await {
+                    Ok(_) => download_status.set("已打开下载目录".to_string()),
                     Err(err) => download_status
-                        .set(err.as_string().unwrap_or_else(|| "保存失败".to_string())),
+                        .set(err.as_string().unwrap_or_else(|| "打开下载目录失败".to_string())),
                 }
             });
         }
@@ -2081,26 +2114,11 @@ fn SettingsView(
                     <div class="setting-field wide download-setting">
                         <span>"下载位置"</span>
                         <div class="download-path-row">
-                            <input
-                                type="text"
-                                prop:value=move || download_path.get()
-                                on:input=move |ev| download_path.set(event_target_value(&ev))
-                            />
-                            <button type="button" class="settings-save-btn" on:click=save_download_path><i class="iconfont icon-wenjianjia"></i><span>"保存"</span></button>
+                            <div class="download-path-display" title=move || download_path.get()>{move || download_path.get()}</div>
+                            <button type="button" class="settings-save-btn" on:click=pick_download_path><i class="iconfont icon-wenjianjia"></i><span>"选择文件夹"</span></button>
+                            <button type="button" class="settings-save-btn" on:click=reveal_download_dir><i class="iconfont icon-dakaiwenjianjia"></i><span>"打开"</span></button>
                         </div>
                         <div class="download-drive-row">
-                            {move || download_drives.get().into_iter().map(|drive| {
-                                let drive_for_click = drive.clone();
-                                let drive_for_active = drive.clone();
-                                view! {
-                                    <button
-                                        type="button"
-                                        class="drive-chip"
-                                        class:active=move || download_path.get().starts_with(&drive_for_active)
-                                        on:click=move |_| download_path.set(format!("{drive_for_click}MikuTunes"))
-                                    >{drive}</button>
-                                }
-                            }).collect_view()}
                             <span class="download-status">{move || download_status.get()}</span>
                         </div>
                     </div>
@@ -2238,22 +2256,34 @@ fn RightPanel(
     }
 }
 
-fn load_favorites() -> FavoritesData {
+fn favorites_is_empty(data: &FavoritesData) -> bool {
+    data.songs.is_empty() && data.playlists.is_empty()
+}
+
+fn load_legacy_favorites() -> FavoritesData {
     web_sys::window()
         .and_then(|window| window.local_storage().ok().flatten())
-        .and_then(|storage| storage.get_item(FAVORITES_KEY).ok().flatten())
+        .and_then(|storage| storage.get_item(LEGACY_FAVORITES_KEY).ok().flatten())
         .and_then(|raw| serde_json::from_str::<FavoritesData>(&raw).ok())
         .unwrap_or_default()
 }
 
-fn save_favorites(data: &FavoritesData) {
-    if let Some(storage) =
-        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+fn persist_favorites(data: &FavoritesData) {
+    if let Some(storage) = web_sys::window().and_then(|window| window.local_storage().ok().flatten())
     {
         if let Ok(raw) = serde_json::to_string(data) {
-            let _ = storage.set_item(FAVORITES_KEY, &raw);
+            let _ = storage.set_item(LEGACY_FAVORITES_KEY, &raw);
         }
     }
+
+    let data = data.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        let args = js_sys::Object::new();
+        if let Ok(value) = serde_wasm_bindgen::to_value(&data) {
+            let _ = js_sys::Reflect::set(&args, &JsValue::from_str("data"), &value);
+            let _ = invoke("save_favorites", Some(&args)).await;
+        }
+    });
 }
 
 fn same_song_favorite(left: &FavoriteSong, right: &FavoriteSong) -> bool {

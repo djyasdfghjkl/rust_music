@@ -1,17 +1,63 @@
 mod source_engine;
 
+use futures_util::StreamExt;
 use source_engine::*;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::PathBuf;
+#[cfg(not(target_os = "android"))]
+use std::process::Command;
 use std::sync::{Arc, Mutex, OnceLock};
-use tauri::{Emitter, State};
+use tokio::io::AsyncWriteExt;
+use tauri::{Emitter, Manager, State};
 
 struct AppState {
     engine: Arc<SourceEngine>,
     download_dir: Mutex<PathBuf>,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct DownloadProgressEvent {
+    title: String,
+    artist: String,
+    progress: f64,
+    status: String,
+    message: String,
+    path: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct FavoritesData {
+    songs: Vec<FavoriteSong>,
+    playlists: Vec<FavoritePlaylist>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FavoriteSong {
+    id: String,
+    title: String,
+    artist: String,
+    album: Option<String>,
+    cover_url: Option<String>,
+    duration: Option<f64>,
+    source_id: usize,
+    source: String,
+    platform: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FavoritePlaylist {
+    id: String,
+    name: String,
+    cover: Option<String>,
+    song_count: Option<usize>,
+    source_id: usize,
+    source_name: String,
+    external_url: Option<String>,
+}
+
 static GLOBAL_ENGINE: OnceLock<Arc<SourceEngine>> = OnceLock::new();
+static GLOBAL_APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
+static GLOBAL_APP_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 fn get_engine() -> &'static Arc<SourceEngine> {
     GLOBAL_ENGINE.get().expect("Engine not initialized")
@@ -218,7 +264,199 @@ async fn get_song_info(
     engine.get_song_info(source_id, &song_id, &platform).await
 }
 
+fn emit_download_event(
+    app: &tauri::AppHandle,
+    title: &str,
+    artist: &str,
+    progress: f64,
+    status: &str,
+    message: impl Into<String>,
+    path: Option<String>,
+) {
+    let _ = app.emit(
+        "download_progress",
+        DownloadProgressEvent {
+            title: title.to_string(),
+            artist: artist.to_string(),
+            progress: progress.clamp(0.0, 1.0),
+            status: status.to_string(),
+            message: message.into(),
+            path,
+        },
+    );
+}
+
+fn normalized_extension(format: &str) -> String {
+    let value = format
+        .trim()
+        .trim_start_matches('.')
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    if value.is_empty() {
+        "mp3".to_string()
+    } else {
+        value
+    }
+}
+
+fn target_download_path(
+    dir: &std::path::Path,
+    title: &str,
+    artist: &str,
+    format: &str,
+) -> PathBuf {
+    let extension = normalized_extension(format);
+    let file_name = format!(
+        "{} - {}.{}",
+        sanitize_file_name(title),
+        sanitize_file_name(artist),
+        sanitize_file_name(&extension)
+    );
+    dir.join(file_name)
+}
+
+fn resolve_local_audio_path(url: &str) -> Option<PathBuf> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with("http://asset.localhost/") {
+        let encoded = trimmed.trim_start_matches("http://asset.localhost/");
+        let decoded = urlencoding::decode(encoded).ok()?.to_string();
+        return Some(PathBuf::from(decoded));
+    }
+    if trimmed.starts_with("https://asset.localhost/") {
+        let encoded = trimmed.trim_start_matches("https://asset.localhost/");
+        let decoded = urlencoding::decode(encoded).ok()?.to_string();
+        return Some(PathBuf::from(decoded));
+    }
+    if trimmed.starts_with("asset://localhost/") {
+        let encoded = trimmed.trim_start_matches("asset://localhost/");
+        let decoded = urlencoding::decode(encoded).ok()?.to_string();
+        return Some(PathBuf::from(decoded));
+    }
+    if trimmed.starts_with("file://localhost/") {
+        let encoded = trimmed.trim_start_matches("file://localhost/");
+        let decoded = urlencoding::decode(encoded).ok()?.to_string();
+        return Some(PathBuf::from(decoded));
+    }
+    if trimmed.starts_with("file:///") {
+        let encoded = trimmed.trim_start_matches("file://");
+        let decoded = urlencoding::decode(encoded).ok()?.to_string();
+        return Some(PathBuf::from(decoded));
+    }
+    if trimmed.starts_with('/')
+        || trimmed.starts_with("\\\\")
+        || trimmed.contains(":\\")
+    {
+        return Some(PathBuf::from(trimmed));
+    }
+    None
+}
+
+fn copy_local_file_with_progress(
+    app: &tauri::AppHandle,
+    source_path: &std::path::Path,
+    target_path: &std::path::Path,
+    title: &str,
+    artist: &str,
+) -> Result<(), String> {
+    let total = std::fs::metadata(source_path)
+        .map(|meta| meta.len())
+        .map_err(|err| format!("读取缓存文件信息失败: {err}"))?;
+    let mut reader =
+        std::fs::File::open(source_path).map_err(|err| format!("打开缓存文件失败: {err}"))?;
+    let mut writer =
+        std::fs::File::create(target_path).map_err(|err| format!("创建下载文件失败: {err}"))?;
+    let mut downloaded = 0u64;
+    let mut buffer = vec![0u8; 256 * 1024];
+
+    loop {
+        let read = reader
+            .read(&mut buffer)
+            .map_err(|err| format!("读取缓存文件失败: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        writer
+            .write_all(&buffer[..read])
+            .map_err(|err| format!("写入下载文件失败: {err}"))?;
+        downloaded = downloaded.saturating_add(read as u64);
+        let progress = if total > 0 {
+            downloaded as f64 / total as f64
+        } else {
+            1.0
+        };
+        emit_download_event(
+            app,
+            title,
+            artist,
+            progress,
+            "progress",
+            format!("正在下载《{}》", title),
+            None,
+        );
+    }
+
+    Ok(())
+}
+
+async fn download_remote_file_with_progress(
+    app: &tauri::AppHandle,
+    url: &str,
+    target_path: &std::path::Path,
+    title: &str,
+    artist: &str,
+) -> Result<(), String> {
+    let client = reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        .build()
+        .map_err(|err| err.to_string())?;
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| format!("下载请求失败: {err}"))?
+        .error_for_status()
+        .map_err(|err| format!("下载请求失败: {err}"))?;
+    let total = response.content_length();
+    let mut stream = response.bytes_stream();
+    let mut file = tokio::fs::File::create(target_path)
+        .await
+        .map_err(|err| format!("创建下载文件失败: {err}"))?;
+    let mut downloaded = 0u64;
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|err| format!("读取下载内容失败: {err}"))?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|err| format!("写入下载文件失败: {err}"))?;
+        downloaded = downloaded.saturating_add(chunk.len() as u64);
+        let progress = total
+            .map(|value| downloaded as f64 / value.max(1) as f64)
+            .unwrap_or(0.0);
+        emit_download_event(
+            app,
+            title,
+            artist,
+            progress,
+            "progress",
+            format!("正在下载《{}》", title),
+            None,
+        );
+    }
+
+    file.flush()
+        .await
+        .map_err(|err| format!("写入下载文件失败: {err}"))?;
+    Ok(())
+}
+
 async fn download_song_to_dir(
+    app: &tauri::AppHandle,
     dir: PathBuf,
     url: String,
     title: String,
@@ -229,41 +467,65 @@ async fn download_song_to_dir(
         return Err("播放链接为空，无法下载".to_string());
     }
 
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        .build()
-        .map_err(|err| err.to_string())?;
-    let bytes = client
-        .get(&url)
-        .send()
-        .await
-        .map_err(|err| format!("下载请求失败: {err}"))?
-        .bytes()
-        .await
-        .map_err(|err| format!("读取下载内容失败: {err}"))?;
-
-    std::fs::create_dir_all(&dir).map_err(|err| format!("创建下载目录失败: {err}"))?;
-    let extension = if format.trim().is_empty() {
-        "mp3"
-    } else {
-        format.trim()
+    let target_dir = match std::fs::create_dir_all(&dir) {
+        Ok(_) => dir,
+        Err(primary_error) => {
+            let fallback = resolve_download_dir_for_app(app);
+            std::fs::create_dir_all(&fallback).map_err(|fallback_error| {
+                format!(
+                    "创建下载目录失败: {primary_error}；回退到应用目录也失败: {fallback_error}"
+                )
+            })?;
+            fallback
+        }
     };
-    let file_name = format!(
-        "{} - {}.{}",
-        sanitize_file_name(&title),
-        sanitize_file_name(&artist),
-        sanitize_file_name(extension)
+    let path = target_download_path(&target_dir, &title, &artist, &format);
+    emit_download_event(
+        app,
+        &title,
+        &artist,
+        0.0,
+        "started",
+        format!("开始下载《{}》", title),
+        None,
     );
-    let path = dir.join(file_name);
-    let mut file = std::fs::File::create(&path).map_err(|err| format!("创建文件失败: {err}"))?;
-    file.write_all(&bytes)
-        .map_err(|err| format!("写入文件失败: {err}"))?;
-    Ok(path.to_string_lossy().to_string())
+
+    let result = if let Some(local_path) = resolve_local_audio_path(&url) {
+        copy_local_file_with_progress(app, &local_path, &path, &title, &artist)
+    } else {
+        download_remote_file_with_progress(app, &url, &path, &title, &artist).await
+    };
+
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&path);
+        emit_download_event(
+            app,
+            &title,
+            &artist,
+            0.0,
+            "error",
+            error.clone(),
+            None,
+        );
+        return Err(error);
+    }
+
+    let saved = path.to_string_lossy().to_string();
+    emit_download_event(
+        app,
+        &title,
+        &artist,
+        1.0,
+        "success",
+        format!("下载成功：{}", path.file_name().and_then(|name| name.to_str()).unwrap_or("音频文件")),
+        Some(saved.clone()),
+    );
+    Ok(saved)
 }
 
 #[tauri::command]
 async fn download_song(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     url: String,
     title: String,
@@ -275,11 +537,12 @@ async fn download_song(
         .lock()
         .map_err(|_| "下载目录状态被占用".to_string())?
         .clone();
-    download_song_to_dir(dir, url, title, artist, format).await
+    download_song_to_dir(&app, dir, url, title, artist, format).await
 }
 
 #[tauri::command]
 async fn download_song_by_id(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     source_id: usize,
     song_id: String,
@@ -297,7 +560,7 @@ async fn download_song_by_id(
         .lock()
         .map_err(|_| "下载目录状态被占用".to_string())?
         .clone();
-    download_song_to_dir(dir, song.url, title, artist, song.format).await
+    download_song_to_dir(&app, dir, song.url, title, artist, song.format).await
 }
 
 #[tauri::command]
@@ -330,6 +593,127 @@ fn set_download_dir(state: State<'_, AppState>, path: String) -> Result<String, 
 }
 
 #[tauri::command]
+fn load_favorites() -> FavoritesData {
+    load_favorites_data()
+}
+
+#[tauri::command]
+fn save_favorites(data: FavoritesData) -> Result<String, String> {
+    save_favorites_data(&data).map(|path| path.to_string_lossy().to_string())
+}
+
+#[tauri::command]
+fn get_favorites_path() -> String {
+    favorites_storage_path().to_string_lossy().to_string()
+}
+
+#[tauri::command]
+fn pick_download_dir(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    #[cfg(target_os = "android")]
+    {
+        let current = state
+            .download_dir
+            .lock()
+            .map_err(|_| "下载目录状态被占用".to_string())?
+            .clone();
+        return Err(format!(
+            "Android 当前使用应用内部下载目录：{}",
+            current.to_string_lossy()
+        ));
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+    let current = state
+        .download_dir
+        .lock()
+        .map_err(|_| "下载目录状态被占用".to_string())?
+        .clone();
+    let selected = rfd::FileDialog::new()
+        .set_directory(current)
+        .pick_folder();
+    let Some(dir) = selected else {
+        return Ok(None);
+    };
+    std::fs::create_dir_all(&dir).map_err(|err| format!("创建下载目录失败: {err}"))?;
+    {
+        let mut download_dir = state
+            .download_dir
+            .lock()
+            .map_err(|_| "下载目录状态被占用".to_string())?;
+        *download_dir = dir.clone();
+    }
+    save_download_dir(&dir)?;
+    Ok(Some(dir.to_string_lossy().to_string()))
+    }
+}
+
+#[tauri::command]
+fn reveal_in_folder(path: String) -> Result<(), String> {
+    let target = PathBuf::from(path.trim());
+    if !target.exists() {
+        return Err("目标文件或目录不存在".to_string());
+    }
+
+    #[cfg(target_os = "android")]
+    {
+        let _ = target;
+        return Err("Android 版本暂不支持直接打开文件夹，请在系统文件管理器中查看应用目录".to_string());
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        let status = if target.is_dir() {
+            Command::new("open").arg(&target).status()
+        } else {
+            Command::new("open").arg("-R").arg(&target).status()
+        }
+        .map_err(|err| format!("打开 Finder 失败: {err}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err("打开 Finder 失败".to_string());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let status = if target.is_dir() {
+            Command::new("explorer").arg(&target).status()
+        } else {
+            Command::new("explorer")
+                .arg("/select,")
+                .arg(&target)
+                .status()
+        }
+        .map_err(|err| format!("打开文件夹失败: {err}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err("打开文件夹失败".to_string());
+    }
+
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows"), not(target_os = "android")))]
+    {
+        let open_target = if target.is_dir() {
+            target.clone()
+        } else {
+            target
+                .parent()
+                .map(std::path::Path::to_path_buf)
+                .unwrap_or(target.clone())
+        };
+        let status = Command::new("xdg-open")
+            .arg(&open_target)
+            .status()
+            .map_err(|err| format!("打开文件夹失败: {err}"))?;
+        if status.success() {
+            return Ok(());
+        }
+        return Err("打开文件夹失败".to_string());
+    }
+}
+
+#[tauri::command]
 fn list_windows_drives() -> Vec<String> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -351,11 +735,19 @@ async fn parse_kugou_playlist(url: String) -> Result<SharedPlaylist, String> {
     parse_kugou_shared_playlist(&url).await
 }
 
+#[cfg(not(target_os = "android"))]
 fn default_download_dir() -> PathBuf {
     home_dir().join("Downloads").join("MikuTunes")
 }
 
 fn app_cache_dir() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        if let Some(path) = GLOBAL_APP_CACHE_DIR.get() {
+            return path.clone();
+        }
+    }
+
     #[cfg(target_os = "windows")]
     {
         return std::env::var_os("LOCALAPPDATA")
@@ -408,11 +800,56 @@ fn app_config_base_dir() -> PathBuf {
 
 #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
 fn app_config_base_dir() -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        if let Some(path) = GLOBAL_APP_DATA_DIR.get() {
+            return path.clone();
+        }
+    }
+
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| home_dir().join(".config"))
 }
 
+fn resolve_managed_data_dir(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| home_dir().join(".config").join("com.lin.music-tauri"))
+}
+
+fn resolve_managed_cache_dir(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_cache_dir()
+        .unwrap_or_else(|_| app_cache_dir())
+}
+
+fn resolve_download_dir_for_app(app: &tauri::AppHandle) -> PathBuf {
+    #[cfg(target_os = "android")]
+    {
+        let dir = resolve_managed_data_dir(app).join("downloads");
+        let _ = std::fs::create_dir_all(&dir);
+        return dir;
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let configured = load_download_dir();
+        if std::fs::create_dir_all(&configured).is_ok() {
+            return configured;
+        }
+
+        let dir = app
+            .path()
+            .download_dir()
+            .map(|path| path.join("MikuTunes"))
+            .unwrap_or_else(|_| default_download_dir());
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 fn load_download_dir() -> PathBuf {
     let path = settings_path();
     let Ok(text) = std::fs::read_to_string(path) else {
@@ -444,29 +881,143 @@ fn save_download_dir(dir: &PathBuf) -> Result<(), String> {
     .map_err(|err| format!("保存设置失败: {err}"))
 }
 
+fn favorites_file_name() -> &'static str {
+    "favorites.json"
+}
+
+fn portable_data_dir() -> PathBuf {
+    let app_name = "MikuTunesData";
+
+    if let Ok(exe) = std::env::current_exe() {
+        let mut cursor = exe.parent().map(std::path::Path::to_path_buf);
+        while let Some(path) = cursor {
+            if path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("app"))
+            {
+                if let Some(parent) = path.parent() {
+                    return parent.join(app_name);
+                }
+            }
+            cursor = path.parent().map(std::path::Path::to_path_buf);
+        }
+
+        if let Some(parent) = exe.parent() {
+            return parent.join(app_name);
+        }
+    }
+
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(app_name)
+}
+
+fn fallback_data_dir() -> PathBuf {
+    app_config_base_dir().join("MikuTunes")
+}
+
+fn portable_favorites_path() -> PathBuf {
+    portable_data_dir().join(favorites_file_name())
+}
+
+fn fallback_favorites_path() -> PathBuf {
+    fallback_data_dir().join(favorites_file_name())
+}
+
+fn ensure_parent(path: &std::path::Path) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| format!("创建数据目录失败: {err}"))?;
+    }
+    Ok(())
+}
+
+fn write_favorites_data(path: &std::path::Path, data: &FavoritesData) -> Result<(), String> {
+    ensure_parent(path)?;
+    let raw = serde_json::to_string_pretty(data).map_err(|err| format!("序列化收藏失败: {err}"))?;
+    std::fs::write(path, raw).map_err(|err| format!("保存收藏失败: {err}"))
+}
+
+fn read_favorites_data(path: &std::path::Path) -> Option<FavoritesData> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<FavoritesData>(&raw).ok()
+}
+
+fn favorites_storage_path() -> PathBuf {
+    let portable = portable_favorites_path();
+    if portable.exists() {
+        return portable;
+    }
+    let fallback = fallback_favorites_path();
+    if fallback.exists() {
+        return fallback;
+    }
+    portable
+}
+
+fn load_favorites_data() -> FavoritesData {
+    read_favorites_data(&portable_favorites_path())
+        .or_else(|| read_favorites_data(&fallback_favorites_path()))
+        .unwrap_or_default()
+}
+
+fn save_favorites_data(data: &FavoritesData) -> Result<PathBuf, String> {
+    let portable = portable_favorites_path();
+    match write_favorites_data(&portable, data) {
+        Ok(_) => Ok(portable),
+        Err(primary_error) => {
+            let fallback = fallback_favorites_path();
+            write_favorites_data(&fallback, data).map_err(|fallback_error| {
+                format!(
+                    "保存收藏失败：同级目录写入失败（{}）；应用数据目录写入也失败（{}）",
+                    primary_error, fallback_error
+                )
+            })?;
+            Ok(fallback)
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     println!("Starting Miku Tunes...");
 
-    let source_dir = resolve_source_dir();
-    let audio_cache_dir = app_cache_dir().join("audio-cache");
-
-    println!("Source dir: {:?}", source_dir);
-    println!("Audio cache dir: {:?}", audio_cache_dir);
-    let engine = Arc::new(SourceEngine::new(source_dir, audio_cache_dir));
-    println!(
-        "Engine initialized with {} sources",
-        engine.get_sources().len()
-    );
-    let _ = GLOBAL_ENGINE.set(engine.clone());
-    let download_dir = load_download_dir();
-
     println!("Before tauri::Builder::run()...");
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(AppState {
-            engine,
-            download_dir: Mutex::new(download_dir),
+        .setup(|app| {
+            let app_handle = app.handle().clone();
+            let source_dir = resolve_source_dir();
+            let data_dir = resolve_managed_data_dir(&app_handle);
+            let cache_dir = resolve_managed_cache_dir(&app_handle);
+            let audio_cache_dir = cache_dir.join("audio-cache");
+
+            let _ = std::fs::create_dir_all(&data_dir);
+            let _ = std::fs::create_dir_all(&audio_cache_dir);
+            let _ = GLOBAL_APP_DATA_DIR.set(data_dir);
+            let _ = GLOBAL_APP_CACHE_DIR.set(cache_dir);
+
+            println!("Source dir: {:?}", source_dir);
+            println!("Audio cache dir: {:?}", audio_cache_dir);
+
+            let engine = Arc::new(SourceEngine::new(source_dir, audio_cache_dir));
+            println!(
+                "Engine initialized with {} sources",
+                engine.get_sources().len()
+            );
+            let _ = GLOBAL_ENGINE.set(engine.clone());
+
+            let download_dir = resolve_download_dir_for_app(&app_handle);
+            let _ = std::fs::create_dir_all(&download_dir);
+            if cfg!(target_os = "android") {
+                let _ = save_download_dir(&download_dir);
+            }
+
+            app.manage(AppState {
+                engine,
+                download_dir: Mutex::new(download_dir),
+            });
+            Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             greet,
@@ -491,6 +1042,11 @@ pub fn run() {
             get_song_info,
             get_download_dir,
             set_download_dir,
+            load_favorites,
+            save_favorites,
+            get_favorites_path,
+            pick_download_dir,
+            reveal_in_folder,
             list_windows_drives,
             download_song,
             download_song_by_id,

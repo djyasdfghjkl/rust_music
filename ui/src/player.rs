@@ -24,6 +24,7 @@ pub struct TrackInfo {
     pub quality: Option<String>,
     pub format: Option<String>,
     pub duration: Option<f64>,
+    pub downloaded_path: Option<String>,
 }
 
 impl TrackInfo {
@@ -40,6 +41,7 @@ impl TrackInfo {
             quality: None,
             format: None,
             duration: None,
+            downloaded_path: None,
         }
     }
 
@@ -78,6 +80,13 @@ fn random_color() -> String {
     colors[idx.min(colors.len() - 1)].to_string()
 }
 
+fn is_mobile_viewport() -> bool {
+    web_sys::window()
+        .and_then(|window| window.inner_width().ok())
+        .and_then(|value| value.as_f64())
+        .is_some_and(|width| width <= 900.0)
+}
+
 #[derive(Clone)]
 pub struct PlayerState {
     pub queue: RwSignal<Vec<TrackInfo>>,
@@ -94,6 +103,12 @@ pub struct PlayerState {
     pub show_queue: RwSignal<bool>,
     pub song_info: RwSignal<Option<SongInfoResult>>,
     pub last_error: RwSignal<Option<String>>,
+    pub is_downloading: RwSignal<bool>,
+    pub download_progress: RwSignal<f64>,
+    pub download_status: RwSignal<Option<String>>,
+    pub download_message: RwSignal<Option<String>>,
+    pub last_download_path: RwSignal<Option<String>>,
+    pub last_download_track_key: RwSignal<Option<String>>,
     pub lyric_auto_scroll_after: RwSignal<f64>,
     pub spectrum: RwSignal<Vec<f64>>,
 }
@@ -115,10 +130,47 @@ impl PlayerState {
             show_queue: RwSignal::new(false),
             song_info: RwSignal::new(None),
             last_error: RwSignal::new(None),
+            is_downloading: RwSignal::new(false),
+            download_progress: RwSignal::new(0.0),
+            download_status: RwSignal::new(None),
+            download_message: RwSignal::new(None),
+            last_download_path: RwSignal::new(None),
+            last_download_track_key: RwSignal::new(None),
             lyric_auto_scroll_after: RwSignal::new(0.0),
             spectrum: RwSignal::new(vec![0.18; 18]),
         }
     }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct DownloadProgressEvent {
+    title: String,
+    artist: String,
+    progress: f64,
+    status: String,
+    message: String,
+    path: Option<String>,
+}
+
+fn track_download_key(title: &str, artist: &str) -> String {
+    format!("{}::{}", title.trim(), artist.trim())
+}
+
+fn set_download_feedback(
+    state: &PlayerState,
+    status: &str,
+    message: impl Into<String>,
+    progress: f64,
+    path: Option<String>,
+    track_key: Option<String>,
+) {
+    let status = status.to_string();
+    state.is_downloading.set(matches!(status.as_str(), "started" | "progress"));
+    state.download_status.set(Some(status));
+    state.download_message.set(Some(message.into()));
+    state.download_progress.set(progress.clamp(0.0, 1.0));
+    state.last_download_path.set(path);
+    state.last_download_track_key.set(track_key);
 }
 
 fn get_or_create_audio() -> JsValue {
@@ -136,6 +188,13 @@ fn get_or_create_audio() -> JsValue {
         &JsValue::from_str("preload"),
         &JsValue::from_str("auto"),
     );
+    let _ = js_sys::Reflect::set(
+        &audio,
+        &JsValue::from_str("playsInline"),
+        &JsValue::from_bool(true),
+    );
+    let _ = audio.set_attribute("playsinline", "true");
+    let _ = audio.set_attribute("webkit-playsinline", "true");
     let _ = body.append_child(&audio);
     audio.into()
 }
@@ -258,7 +317,31 @@ pub fn setup_audio_events(state: PlayerState) {
     let cb_error = Closure::wrap(Box::new(move || {
         state_error.is_playing.set(false);
         state_error.is_resolving.set(false);
-        state_error.last_error.set(Some("播放失败".to_string()));
+        let audio = get_or_create_audio();
+        let media_error = js_sys::Reflect::get(&audio, &JsValue::from_str("error"))
+            .ok()
+            .filter(|value| !value.is_null() && !value.is_undefined());
+        let code = media_error
+            .as_ref()
+            .and_then(|value| js_sys::Reflect::get(value, &JsValue::from_str("code")).ok())
+            .and_then(|value| value.as_f64())
+            .map(|value| value as i32);
+        let current_src = js_sys::Reflect::get(&audio, &JsValue::from_str("src"))
+            .ok()
+            .and_then(|value| value.as_string())
+            .unwrap_or_default();
+        let message = match code {
+            Some(4) => "播放失败：当前链接在 Android WebView 中不可用".to_string(),
+            Some(3) => "播放失败：音频内容解码失败".to_string(),
+            Some(2) => "播放失败：音频网络请求失败".to_string(),
+            Some(1) => "播放失败：音频加载被中止".to_string(),
+            _ => "播放失败".to_string(),
+        };
+        web_sys::console::error_1(&JsValue::from_str(&format!(
+            "audio error code={:?}, src={}",
+            code, current_src
+        )));
+        state_error.last_error.set(Some(message));
     }) as Box<dyn Fn()>);
     add_listener("error", &cb_error);
     cb_error.forget();
@@ -272,6 +355,46 @@ pub fn setup_audio_events(state: PlayerState) {
     }) as Box<dyn Fn()>);
     add_listener("ended", &cb_ended);
     cb_ended.forget();
+}
+
+pub fn setup_download_events(state: PlayerState) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let handler = Closure::<dyn FnMut(JsValue)>::wrap(Box::new(move |event: JsValue| {
+            let payload = js_sys::Reflect::get(&event, &JsValue::from_str("payload"))
+                .ok()
+                .filter(|value| !value.is_undefined() && !value.is_null())
+                .unwrap_or(event);
+            let Ok(progress) = serde_wasm_bindgen::from_value::<DownloadProgressEvent>(payload) else {
+                return;
+            };
+            let track_key = track_download_key(&progress.title, &progress.artist);
+            set_download_feedback(
+                &state,
+                &progress.status,
+                progress.message.clone(),
+                progress.progress,
+                progress.path.clone(),
+                Some(track_key),
+            );
+            if progress.status == "success" {
+                if let Some(path) = progress.path {
+                    let mut queue = state.queue.get_untracked();
+                    for track in &mut queue {
+                        if track.title == progress.title && track.artist == progress.artist {
+                            track.downloaded_path = Some(path.clone());
+                        }
+                    }
+                    state.queue.set(queue);
+                }
+            }
+        }));
+        let _ = crate::tauri_utils::listen(
+            "download_progress",
+            handler.as_ref().unchecked_ref::<js_sys::Function>(),
+        )
+        .await;
+        handler.forget();
+    });
 }
 
 fn animated_spectrum(time: f64) -> Vec<f64> {
@@ -288,15 +411,38 @@ fn animated_spectrum(time: f64) -> Vec<f64> {
 pub fn play_url(url: &str) {
     audio_set!("src", url);
     audio_call!("load");
-    audio_call!("play");
+    play_current_audio();
 }
 
 fn resume_or_play_url(url: &str) {
     let current_src = audio_get!("src").as_string().unwrap_or_default();
-    if !current_src.is_empty() && current_src == url {
-        audio_call!("play");
+    let same_track = !current_src.is_empty()
+        && (current_src == url || current_src.ends_with(url) || url.ends_with(&current_src));
+    if same_track {
+        play_current_audio();
     } else {
         play_url(url);
+    }
+}
+
+fn play_current_audio() {
+    let audio = get_or_create_audio();
+    if let Ok(function) = js_sys::Reflect::get(&audio, &JsValue::from_str("play"))
+        .and_then(|f| Ok(js_sys::Function::from(f)))
+    {
+        if let Ok(value) = function.call0(&audio) {
+            if value.is_instance_of::<js_sys::Promise>() {
+                let promise = js_sys::Promise::from(value);
+                wasm_bindgen_futures::spawn_local(async move {
+                    if let Err(error) = wasm_bindgen_futures::JsFuture::from(promise).await {
+                        web_sys::console::error_2(
+                            &JsValue::from_str("audio.play() rejected"),
+                            &error,
+                        );
+                    }
+                });
+            }
+        }
     }
 }
 
@@ -869,6 +1015,7 @@ pub fn FullPlayer(
     favorites: RwSignal<FavoritesData>,
     on_toggle_favorite: std::sync::Arc<dyn Fn(FavoriteSong) + Send + Sync>,
 ) -> impl IntoView {
+    let toolbar_expanded = RwSignal::new(!is_mobile_viewport());
     let close_player = {
         let state = state.clone();
         move |_| state.show_full_player.set(false)
@@ -879,6 +1026,11 @@ pub fn FullPlayer(
             .current_index
             .get()
             .and_then(|index| state.queue.get().get(index).cloned())
+    };
+    let current_track_key = move || {
+        current_track()
+            .map(|track| track_download_key(&track.title, &track.artist))
+            .unwrap_or_default()
     };
 
     let title = move || current_track().map(|track| track.title).unwrap_or_default();
@@ -950,8 +1102,20 @@ pub fn FullPlayer(
             String::new()
         }
     };
-    let progress = move || format!("width:{}%", (state.progress.get() * 100.0).round());
-    let thumb_left = move || format!("left:{}%", (state.progress.get() * 100.0).round());
+    let progress_slider_value =
+        move || ((state.progress.get().clamp(0.0, 1.0) * 1000.0).round() as i32).to_string();
+    let progress_slider_style = move || {
+        let value = (state.progress.get().clamp(0.0, 1.0) * 100.0).round();
+        format!(
+            "background:linear-gradient(to right,#39C5BB 0%,#39C5BB {value}%,rgba(255,255,255,0.12) {value}%,rgba(255,255,255,0.12) 100%);"
+        )
+    };
+    let download_progress = move || {
+        format!(
+            "width:{}%",
+            (state.download_progress.get().clamp(0.0, 1.0) * 100.0).round()
+        )
+    };
     let volume_value = move || ((state.volume.get() * 100.0).round() as i32).to_string();
     let volume_style = move || {
         let value = (state.volume.get() * 100.0).round().clamp(0.0, 100.0);
@@ -964,30 +1128,46 @@ pub fn FullPlayer(
         PlayMode::Shuffle => "随机",
         PlayMode::RepeatOne => "单曲",
     };
+    let current_download_path = move || current_track().and_then(|track| track.downloaded_path);
+    let show_download_notice = move || {
+        state.is_downloading.get()
+            || state.download_message.get().is_some()
+                && state
+                    .last_download_track_key
+                    .get()
+                    .is_some_and(|key| key == current_track_key())
+    };
+    let download_notice_class = move || {
+        match state.download_status.get().as_deref() {
+            Some("success") => "success",
+            Some("error") => "error",
+            _ => "active",
+        }
+    };
 
-    let on_seek = move |ev: leptos::ev::MouseEvent| {
-        let element = event_target::<web_sys::Element>(&ev);
-        let js_event: &JsValue = ev.as_ref();
-        let js_element: &JsValue = element.as_ref();
-        let client_x = js_sys::Reflect::get(js_event, &JsValue::from_str("clientX"))
-            .ok()
-            .and_then(|value| value.as_f64())
-            .unwrap_or(0.0);
-        let rect = js_sys::Reflect::get(js_element, &JsValue::from_str("getBoundingClientRect"))
-            .ok()
-            .and_then(|function| js_sys::Function::from(function).call0(&element).ok());
-        let left = rect
-            .as_ref()
-            .and_then(|rect| js_sys::Reflect::get(rect, &JsValue::from_str("left")).ok())
-            .and_then(|value| value.as_f64())
-            .unwrap_or(0.0);
-        let width = rect
-            .as_ref()
-            .and_then(|rect| js_sys::Reflect::get(rect, &JsValue::from_str("width")).ok())
-            .and_then(|value| value.as_f64())
-            .unwrap_or(1.0);
-        if width > 0.0 {
-            seek(((client_x - left) / width).clamp(0.0, 1.0));
+    let on_progress_input = {
+        let state = state.clone();
+        move |ev: leptos::ev::Event| {
+            let Ok(value) = event_target_value(&ev).parse::<f64>() else {
+                return;
+            };
+            let ratio = (value / 1000.0).clamp(0.0, 1.0);
+            let should_resume = state.is_playing.get_untracked();
+            let current_url = state
+                .current_index
+                .get_untracked()
+                .and_then(|index| state.queue.get_untracked().get(index).and_then(|track| track.url.clone()));
+            seek(ratio);
+            if should_resume {
+                let current_src = audio_get!("src").as_string().unwrap_or_default();
+                if current_src.is_empty() {
+                    if let Some(url) = current_url {
+                        play_url(&url);
+                    }
+                } else {
+                    play_current_audio();
+                }
+            }
         }
     };
 
@@ -1066,6 +1246,9 @@ pub fn FullPlayer(
         let state = state.clone();
         move |_| state.show_queue.update(|show| *show = !*show)
     };
+    let toggle_toolbar = move |_| {
+        toolbar_expanded.update(|open| *open = !*open);
+    };
     let toggle_favorite = {
         let on_toggle = on_toggle_favorite.clone();
         move |_| {
@@ -1094,13 +1277,35 @@ pub fn FullPlayer(
         let state = state.clone();
         move |_| {
             let Some(track) = current_track() else {
-                state.last_error.set(Some("暂无歌曲可下载".to_string()));
+                set_download_feedback(
+                    &state,
+                    "error",
+                    "暂无歌曲可下载",
+                    0.0,
+                    None,
+                    None,
+                );
                 return;
             };
             let Some(url) = track.url.clone() else {
-                state.last_error.set(Some("暂无播放链接可下载".to_string()));
+                set_download_feedback(
+                    &state,
+                    "error",
+                    "暂无播放链接可下载",
+                    0.0,
+                    None,
+                    Some(track_download_key(&track.title, &track.artist)),
+                );
                 return;
             };
+            set_download_feedback(
+                &state,
+                "started",
+                format!("开始下载《{}》", track.title),
+                0.0,
+                None,
+                Some(track_download_key(&track.title, &track.artist)),
+            );
             let args = js_sys::Object::new();
             let _ =
                 js_sys::Reflect::set(&args, &JsValue::from_str("url"), &JsValue::from_str(&url));
@@ -1122,15 +1327,57 @@ pub fn FullPlayer(
             let state = state.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 match invoke("download_song", Some(&args)).await {
-                    Ok(value) => state.last_error.set(Some(
-                        value.as_string().unwrap_or_else(|| "下载完成".to_string()),
-                    )),
-                    Err(error) => state.last_error.set(Some(
-                        error.as_string().unwrap_or_else(|| "下载失败".to_string()),
-                    )),
+                    Ok(value) => {
+                        if let Some(path) = value.as_string() {
+                            let mut queue = state.queue.get_untracked();
+                            for queued in &mut queue {
+                                if queued.title == track.title && queued.artist == track.artist {
+                                    queued.downloaded_path = Some(path.clone());
+                                }
+                            }
+                            state.queue.set(queue);
+                        }
+                    }
+                    Err(error) => {
+                        if state.download_status.get_untracked().as_deref() != Some("error") {
+                            set_download_feedback(
+                                &state,
+                                "error",
+                                error.as_string().unwrap_or_else(|| "下载失败".to_string()),
+                                0.0,
+                                None,
+                                Some(track_download_key(&track.title, &track.artist)),
+                            );
+                        }
+                    }
                 }
             });
         }
+    };
+    let reveal_download_action: std::sync::Arc<dyn Fn() + Send + Sync> = {
+        let state = state.clone();
+        std::sync::Arc::new(move || {
+            let Some(path) = current_track().and_then(|track| track.downloaded_path) else {
+                set_download_feedback(&state, "error", "当前歌曲尚未下载", 0.0, None, None);
+                return;
+            };
+            let args = js_sys::Object::new();
+            let _ =
+                js_sys::Reflect::set(&args, &JsValue::from_str("path"), &JsValue::from_str(&path));
+            let state = state.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Err(error) = invoke("reveal_in_folder", Some(&args)).await {
+                    set_download_feedback(
+                        &state,
+                        "error",
+                        error.as_string().unwrap_or_else(|| "打开文件夹失败".to_string()),
+                        0.0,
+                        Some(path),
+                        state.last_download_track_key.get_untracked(),
+                    );
+                }
+            });
+        })
     };
 
     let queue_state = state.clone();
@@ -1170,19 +1417,60 @@ pub fn FullPlayer(
                 <div class="fp-background" style=move || format!("background:{}", cover())></div>
                 <div class="fp-backdrop"></div>
 
-                <button class="fp-close" on:click=close_player>"关闭"</button>
-
-                <div class="fp-toolbar">
-                    <button class="fp-tool-btn" on:click=close_player><i class="btn-icon iconfont icon-31fanhui1"></i><span>"返回"</span></button>
-                    <button class="fp-tool-btn" class:active=move || state.show_lyrics.get() on:click=toggle_lyrics><i class="btn-icon iconfont icon-geci"></i><span>"歌词"</span></button>
-                    <button class="fp-tool-btn" class:active=move || state.show_queue.get() on:click=toggle_queue><i class="btn-icon iconfont icon-gedan"></i><span>"队列"</span></button>
-                    <button class="fp-tool-btn" on:click=toggle_mode><i class="btn-icon iconfont icon-shunxubofang"></i><span>{mode_label}</span></button>
-                    <button class="fp-tool-btn fp-fav-btn" class:active=is_favorited on:click=toggle_favorite>
-                        <i class="btn-icon iconfont icon-shoucang"></i>
-                        <span>{move || if is_favorited() { "已收藏" } else { "收藏" }}</span>
-                    </button>
-                    <button class="fp-tool-btn" on:click=copy_link><i class="btn-icon iconfont icon-fuzhilianjie"></i><span>"复制链接"</span></button>
-                    <button class="fp-tool-btn" on:click=download_current><i class="btn-icon iconfont icon-xiazai"></i><span>"下载"</span></button>
+                <div class="fp-toolbar-shell">
+                    <div class="fp-toolbar-summary">
+                        <button class="fp-tool-btn fp-tool-btn-back" on:click=close_player><i class="btn-icon iconfont icon-31fanhui1"></i><span>"返回"</span></button>
+                        <button class="fp-tool-btn fp-toolbar-toggle" class:active=move || toolbar_expanded.get() on:click=toggle_toolbar>
+                            <i class="btn-icon iconfont icon-add-s"></i>
+                            <span>{move || if toolbar_expanded.get() { "收起操作" } else { "展开操作" }}</span>
+                        </button>
+                    </div>
+                    <div class="fp-toolbar-actions" style=move || if toolbar_expanded.get() { "" } else { "display:none;" }>
+                        <button class="fp-tool-btn" class:active=move || state.show_lyrics.get() on:click=toggle_lyrics><i class="btn-icon iconfont icon-geci"></i><span>"歌词"</span></button>
+                        <button class="fp-tool-btn" class:active=move || state.show_queue.get() on:click=toggle_queue><i class="btn-icon iconfont icon-gedan"></i><span>"队列"</span></button>
+                        <button class="fp-tool-btn" on:click=toggle_mode><i class="btn-icon iconfont icon-shunxubofang"></i><span>{mode_label}</span></button>
+                        <button class="fp-tool-btn fp-fav-btn" class:active=is_favorited on:click=toggle_favorite>
+                            <i class="btn-icon iconfont icon-shoucang"></i>
+                            <span>{move || if is_favorited() { "已收藏" } else { "收藏" }}</span>
+                        </button>
+                        <button class="fp-tool-btn" on:click=copy_link><i class="btn-icon iconfont icon-fuzhilianjie"></i><span>"复制链接"</span></button>
+                        <button class="fp-tool-btn" on:click=download_current><i class="btn-icon iconfont icon-xiazai"></i><span>"下载"</span></button>
+                        <button
+                            class="fp-tool-btn"
+                            style=move || if current_download_path().is_some() { "" } else { "display:none;" }
+                            on:click={
+                                let reveal_download_action = reveal_download_action.clone();
+                                move |_| (reveal_download_action)()
+                            }
+                        ><i class="btn-icon iconfont icon-wenjianjia"></i><span>"打开文件夹"</span></button>
+                    </div>
+                </div>
+                <div
+                    class=move || format!("fp-download-notice {}", download_notice_class())
+                    style=move || if show_download_notice() { "" } else { "display:none;" }
+                >
+                    <div class="fp-download-meta">
+                        <span>{move || state.download_message.get().unwrap_or_default()}</span>
+                        <button
+                            class="fp-download-open-btn"
+                            style=move || {
+                                if current_download_path().is_some()
+                                    && state.download_status.get().as_deref() == Some("success")
+                                {
+                                    ""
+                                } else {
+                                    "display:none;"
+                                }
+                            }
+                            on:click={
+                                let reveal_download_action = reveal_download_action.clone();
+                                move |_| (reveal_download_action)()
+                            }
+                        >"打开文件夹"</button>
+                    </div>
+                    <div class="fp-download-track">
+                        <div class="fp-download-fill" style=download_progress></div>
+                    </div>
                 </div>
 
                 <div class="fp-main-area">
@@ -1218,11 +1506,16 @@ pub fn FullPlayer(
                         </div>
 
                         <div class="fp-controls">
-                            <div class="fp-progress-area" on:click=on_seek>
-                                <div class="fp-progress-track">
-                                    <div class="fp-progress-fill" style=progress></div>
-                                    <div class="fp-progress-thumb" style=thumb_left></div>
-                                </div>
+                            <div class="fp-progress-area">
+                                <input
+                                    class="fp-progress-slider"
+                                    type="range"
+                                    min="0"
+                                    max="1000"
+                                    style=progress_slider_style
+                                    prop:value=progress_slider_value
+                                    on:input=on_progress_input
+                                />
                                 <div class="fp-time-display">
                                     <span>{move || format_time(state.current_time.get())}</span>
                                     <span>{move || format_time(state.duration.get())}</span>

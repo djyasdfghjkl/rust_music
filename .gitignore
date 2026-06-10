@@ -40,3 +40,8 @@ Thumbs.db
 # Local environment
 .env
 .env.local
+
+/.android-home/
+/.gradle-home/
+/src-tauri/
+/ui/

@@ -4,6 +4,7 @@
   "description": "This template should help get you started developing with Tauri and Leptos.",
   "main": "index.js",
   "scripts": {
+    "tauri": "npx tauri",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
