@@ -331,6 +331,12 @@ fn set_download_dir(state: State<'_, AppState>, path: String) -> Result<String, 
 
 #[tauri::command]
 fn list_windows_drives() -> Vec<String> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        return Vec::new();
+    }
+
+    #[cfg(target_os = "windows")]
     ('A'..='Z')
         .filter_map(|letter| {
             let drive = format!("{letter}:\\");
@@ -346,23 +352,65 @@ async fn parse_kugou_playlist(url: String) -> Result<SharedPlaylist, String> {
 }
 
 fn default_download_dir() -> PathBuf {
-    std::env::var("USERPROFILE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        .join("Downloads")
-        .join("MikuTunes")
+    home_dir().join("Downloads").join("MikuTunes")
+}
+
+fn app_cache_dir() -> PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        return std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join("AppData").join("Local"))
+            .join("com.lin.music-tauri");
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return home_dir()
+            .join("Library")
+            .join("Caches")
+            .join("com.lin.music-tauri");
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        return std::env::var_os("XDG_CACHE_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home_dir().join(".cache"))
+            .join("com.lin.music-tauri");
+    }
 }
 
 fn settings_path() -> PathBuf {
-    std::env::var("APPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("USERPROFILE")
-                .map(PathBuf::from)
-                .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
-        })
+    app_config_base_dir()
         .join("MikuTunes")
         .join("settings.json")
+}
+
+fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+#[cfg(target_os = "windows")]
+fn app_config_base_dir() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join("AppData").join("Roaming"))
+}
+
+#[cfg(target_os = "macos")]
+fn app_config_base_dir() -> PathBuf {
+    home_dir().join("Library").join("Application Support")
+}
+
+#[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+fn app_config_base_dir() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home_dir().join(".config"))
 }
 
 fn load_download_dir() -> PathBuf {
@@ -401,9 +449,11 @@ pub fn run() {
     println!("Starting Miku Tunes...");
 
     let source_dir = resolve_source_dir();
+    let audio_cache_dir = app_cache_dir().join("audio-cache");
 
     println!("Source dir: {:?}", source_dir);
-    let engine = Arc::new(SourceEngine::new(source_dir));
+    println!("Audio cache dir: {:?}", audio_cache_dir);
+    let engine = Arc::new(SourceEngine::new(source_dir, audio_cache_dir));
     println!(
         "Engine initialized with {} sources",
         engine.get_sources().len()
@@ -480,8 +530,11 @@ fn resolve_source_dir() -> std::path::PathBuf {
         if let Some(exe_dir) = exe.parent() {
             candidates.push(exe_dir.join("音源"));
             candidates.push(exe_dir.join("resources").join("音源"));
+            candidates.push(exe_dir.join("Resources").join("音源"));
             candidates.push(exe_dir.join("_up_").join("resources").join("音源"));
             candidates.push(exe_dir.join("..").join("resources").join("音源"));
+            candidates.push(exe_dir.join("..").join("Resources").join("音源"));
+            candidates.push(exe_dir.join("..").join("..").join("Resources").join("音源"));
         }
     }
 

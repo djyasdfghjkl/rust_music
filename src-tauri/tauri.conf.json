@@ -4,8 +4,9 @@
   "version": "1.0.0",
   "identifier": "com.lin.music-tauri",
   "build": {
-    "beforeDevCommand": "cd /d D:\\code\\music\\music-tauri\\ui && trunk serve",
+    "beforeDevCommand": "cd ui && trunk serve",
     "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "cd ui && trunk build",
     "frontendDist": "../ui/dist"
   },
   "app": {
@@ -25,12 +26,21 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": null,
+      "assetProtocol": {
+        "enable": true,
+        "scope": [
+          "$APPCACHE/audio-cache/**"
+        ]
+      }
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": [
+      "../音源"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

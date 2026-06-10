@@ -448,11 +448,14 @@ fn current_track_matches(state: &PlayerState, idx: usize, song_id: &str, platfor
 }
 
 fn playable_url_from_result(result: &crate::types::SongUrlResult) -> String {
-    if result.url.contains(":\\") || result.url.starts_with("\\\\") {
-        convert_file_src(&result.url, Some("asset"))
-    } else {
-        result.url.clone()
+    if result.url.contains(":\\")
+        || result.url.starts_with("\\\\")
+        || result.url.starts_with('/')
+    {
+        return convert_file_src(&result.url, Some("asset"));
     }
+
+    result.url.clone()
 }
 
 fn apply_song_url_result(

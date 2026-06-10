@@ -2,9 +2,11 @@ use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+use tokio::io::AsyncWriteExt;
 
 const MAX_SEARCH_CONCURRENT: usize = 6;
 
@@ -144,7 +146,7 @@ pub struct SourceEngine {
 }
 
 impl SourceEngine {
-    pub fn new(source_dir: PathBuf) -> Self {
+    pub fn new(source_dir: PathBuf, audio_cache_dir: PathBuf) -> Self {
         let http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(6))
             .connect_timeout(Duration::from_secs(2))
@@ -153,7 +155,6 @@ impl SourceEngine {
             .build()
             .unwrap_or_default();
 
-        let audio_cache_dir = std::env::temp_dir().join("music-tauri-audio-cache");
         if let Err(error) = fs::create_dir_all(&audio_cache_dir) {
             println!(
                 "Failed to create audio cache dir {:?}: {}",
@@ -1370,9 +1371,9 @@ async fn fetch_xiaowo_song_url(client: &reqwest::Client, song_id: &str) -> Optio
 }
 
 async fn materialize_song_url(
-    _client: &reqwest::Client,
-    _cache_dir: &std::path::Path,
-    song: SongUrlResult,
+    client: &reqwest::Client,
+    cache_dir: &std::path::Path,
+    mut song: SongUrlResult,
 ) -> Option<SongUrlResult> {
     if song.url.is_empty() {
         return None;
@@ -1380,7 +1381,111 @@ async fn materialize_song_url(
     if song.url.starts_with("data:") {
         return Some(song);
     }
+    if !song.url.starts_with("http://") && !song.url.starts_with("https://") {
+        return Some(song);
+    }
+
+    if let Some(cached_path) = cache_remote_audio(client, cache_dir, &song.url, &song.format).await {
+        song.url = cached_path;
+    }
+
     Some(song)
+}
+
+async fn cache_remote_audio(
+    client: &reqwest::Client,
+    cache_dir: &std::path::Path,
+    url: &str,
+    format: &str,
+) -> Option<String> {
+    if fs::create_dir_all(cache_dir).is_err() {
+        return None;
+    }
+
+    let extension = sanitize_audio_extension(if format.trim().is_empty() {
+        infer_audio_format(url, None)
+    } else {
+        format.trim().to_string()
+    });
+    let file_path = cache_dir.join(format!("{}.{}", stable_hash(url), extension));
+
+    if file_path.is_file() {
+        return Some(file_path.to_string_lossy().to_string());
+    }
+
+    let response = match client.get(url).timeout(Duration::from_secs(90)).send().await {
+        Ok(response) => match response.error_for_status() {
+            Ok(response) => response,
+            Err(error) => {
+                println!("Audio cache HTTP error for {}: {}", url, error);
+                return None;
+            }
+        },
+        Err(error) => {
+            println!("Audio cache request failed for {}: {}", url, error);
+            return None;
+        }
+    };
+
+    let temp_path = file_path.with_extension(format!("{}.part", extension));
+    let mut file = match tokio::fs::File::create(&temp_path).await {
+        Ok(file) => file,
+        Err(error) => {
+            println!("Audio cache file create failed for {:?}: {}", temp_path, error);
+            return None;
+        }
+    };
+
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            println!("Audio cache read failed for {}: {}", url, error);
+            let _ = tokio::fs::remove_file(&temp_path).await;
+            return None;
+        }
+    };
+
+    if let Err(error) = file.write_all(&bytes).await {
+        println!("Audio cache write failed for {:?}: {}", temp_path, error);
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return None;
+    }
+
+    if let Err(error) = file.flush().await {
+        println!("Audio cache flush failed for {:?}: {}", temp_path, error);
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return None;
+    }
+
+    if let Err(error) = tokio::fs::rename(&temp_path, &file_path).await {
+        println!(
+            "Audio cache rename failed from {:?} to {:?}: {}",
+            temp_path, file_path, error
+        );
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        return None;
+    }
+
+    Some(file_path.to_string_lossy().to_string())
+}
+
+fn stable_hash(value: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    value.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn sanitize_audio_extension(value: String) -> String {
+    let sanitized = value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_lowercase();
+    if sanitized.is_empty() {
+        "mp3".to_string()
+    } else {
+        sanitized
+    }
 }
 
 async fn fetch_xiaowo_song_info(client: &reqwest::Client, song_id: &str) -> Option<SongInfoResult> {
