@@ -889,6 +889,11 @@ pub fn PlayerBar(
             }
         }
     };
+    let mode_icon = move || match state.play_mode.get() {
+        PlayMode::Sequential => "icon-shunxubofang",
+        PlayMode::Shuffle => "icon-suiji",
+        PlayMode::RepeatOne => "icon-danquxunhuan",
+    };
 
     let play_click_state = state.clone();
     let on_play_click = move |ev: leptos::ev::MouseEvent| {
@@ -943,6 +948,19 @@ pub fn PlayerBar(
             }
         }
     };
+    let on_mode_click = {
+        let state = state.clone();
+        move |ev: leptos::ev::MouseEvent| {
+            ev.stop_propagation();
+            state.play_mode.update(|mode| {
+                *mode = match mode {
+                    PlayMode::Sequential => PlayMode::Shuffle,
+                    PlayMode::Shuffle => PlayMode::RepeatOne,
+                    PlayMode::RepeatOne => PlayMode::Sequential,
+                };
+            });
+        }
+    };
 
     view! {
         <div class="player-bar" class:idle=move || state.current_index.get().is_none() on:click=open_player>
@@ -958,10 +976,13 @@ pub fn PlayerBar(
                         <i class=move || if state.is_playing.get() { "btn-icon iconfont icon-zanting" } else { "btn-icon iconfont icon-bofang" }></i>
                     </button>
                     <button class="pb-btn" on:click=on_next_click><i class="btn-icon iconfont icon-xiayigexiayishou"></i></button>
-                    <button class="pb-btn pb-fav" class:active=is_favorited on:click=favorite_click>
+                    <button class="pb-btn" class:active=is_favorited on:click=favorite_click>
                         <i class="btn-icon iconfont icon-shoucang"></i>
                     </button>
-                </div>
+                    <button class="pb-btn" on:click=on_mode_click>
+                         <i class=move || format!("btn-icon iconfont {}", mode_icon())></i>
+                     </button>
+                 </div>
                 <div class="player-bar-time">{hint}</div>
                 <div class="player-bar-lyrics">
                     {move || {
@@ -974,16 +995,19 @@ pub fn PlayerBar(
                             .collect_view()
                     }}
                 </div>
-                <input
-                    class="player-bar-volume"
-                    type="range"
-                    min="0"
-                    max="100"
-                    style=bar_volume_style
-                    prop:value=bar_volume_value
-                    on:click=move |ev| ev.stop_propagation()
-                    on:input=on_bar_volume
-                />
+                <div class="player-bar-volume-wrap">
+                    <i class="iconfont icon-yinliang"></i>
+                    <input
+                        class="player-bar-volume"
+                        type="range"
+                        min="0"
+                        max="100"
+                        style=bar_volume_style
+                        prop:value=bar_volume_value
+                        on:click=move |ev| ev.stop_propagation()
+                        on:input=on_bar_volume
+                    />
+                </div>
                 <AudioBars active=state.is_playing spectrum=state.spectrum />
             </div>
         </div>
@@ -1143,6 +1167,11 @@ pub fn FullPlayer(
             Some("error") => "error",
             _ => "active",
         }
+    };
+    let mode_icon = move || match state.play_mode.get() {
+        PlayMode::Sequential => "icon-shunxubofang",
+        PlayMode::Shuffle => "icon-suiji",
+        PlayMode::RepeatOne => "icon-danquxunhuan",
     };
 
     let on_progress_input = {
@@ -1428,7 +1457,7 @@ pub fn FullPlayer(
                     <div class="fp-toolbar-actions" style=move || if toolbar_expanded.get() { "" } else { "display:none;" }>
                         <button class="fp-tool-btn" class:active=move || state.show_lyrics.get() on:click=toggle_lyrics><i class="btn-icon iconfont icon-geci"></i><span>"歌词"</span></button>
                         <button class="fp-tool-btn" class:active=move || state.show_queue.get() on:click=toggle_queue><i class="btn-icon iconfont icon-gedan"></i><span>"队列"</span></button>
-                        <button class="fp-tool-btn" on:click=toggle_mode><i class="btn-icon iconfont icon-shunxubofang"></i><span>{mode_label}</span></button>
+                        <button class="fp-tool-btn" on:click=toggle_mode><i class=move || format!("btn-icon iconfont {}", mode_icon())></i><span>{mode_label}</span></button>
                         <button class="fp-tool-btn fp-fav-btn" class:active=is_favorited on:click=toggle_favorite>
                             <i class="btn-icon iconfont icon-shoucang"></i>
                             <span>{move || if is_favorited() { "已收藏" } else { "收藏" }}</span>
@@ -1477,18 +1506,22 @@ pub fn FullPlayer(
                     <div class="fp-left-col">
                         <div class="fp-song-info">
                             <div class="fp-cover-art" style=move || format!("background:{}", cover())>
-                                <Show when=move || !cover_url().is_empty()>
-                                    <img
-                                        class="fp-cover-img"
-                                        src=cover_url
-                                        alt="cover"
-                                        on:error=move |ev| {
-                                            let element = event_target::<web_sys::HtmlElement>(&ev);
-                                            let _ = element.style().set_property("display", "none");
-                                        }
-                                    />
+                                <Show
+                                    when=move || !cover_url().is_empty()
+                                    fallback=move || view! { <i class="fp-cover-icon iconfont icon-yinle1"></i> }
+                                >
+                                    <For
+                                        each=move || vec![cover_url()]
+                                        key=|url| url.clone()
+                                        let:url
+                                    >
+                                        <img
+                                            class="fp-cover-img"
+                                            src=url
+                                            alt="cover"
+                                        />
+                                    </For>
                                 </Show>
-                                <i class="fp-cover-icon iconfont icon-yinle1"></i>
                             </div>
                             <h1 class="fp-title">{title}</h1>
                             <p class="fp-artist">{artist}</p>
@@ -1580,7 +1613,12 @@ pub fn FullPlayer(
                         </Show>
 
                         <div class="fp-queue-panel">
-                            <h3 class="fp-panel-title">"播放队列"</h3>
+                            <div class="fp-queue-header">
+                                <h3 class="fp-panel-title">"播放队列"</h3>
+                                <button class="fp-queue-close" on:click=move |_| state.show_queue.set(false)>
+                                    <i class="iconfont icon-guanbi"></i>
+                                </button>
+                            </div>
                             <div class="fp-queue-list">
                                 {queue_view}
                             </div>

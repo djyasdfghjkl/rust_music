@@ -8,7 +8,7 @@ impl AppConfig {
     /// 应用中文描述
     pub const NAME_ZH: &'static str = "基于 Tauri + Rust 的轻量级桌面音乐播放器";
     /// 版本号
-    pub const VERSION: &'static str = "1.0";
+    pub const VERSION: &'static str = "2.0.0";
     /// GitHub 仓库地址
     pub const GITHUB_URL: &'static str = "https://github.com/your-username/miku-tunes";
     /// 项目简介

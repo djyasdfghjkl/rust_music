@@ -30,11 +30,15 @@ struct SourceMeta {
     api_key: String,
     platforms: Vec<String>, // e.g. ["kw", "kg", "tx", "wy", "mg"]
     adapter: Option<NativeSourceAdapter>,
+    can_search: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum NativeSourceAdapter {
     Xiaowo,
+    Kugou,
+    Netease,
+    Bilibili,
 }
 
 // ─── Search result ───
@@ -81,6 +85,7 @@ pub struct HotItem {
 pub struct RankingCategory {
     pub id: String,
     pub name: String,
+    pub cover: Option<String>,
     pub source_id: usize,
     pub source_name: String,
 }
@@ -341,17 +346,286 @@ impl SourceEngine {
             .collect::<Vec<_>>();
         let meta_map = self.meta_map.lock().unwrap().clone();
         let client = self.http_client.clone();
-        let page_start = (offset / 100).max(3);
         let mut all_results = Vec::new();
+        let batch_index = offset / 100; // 0=initial, 1=first load_more, 2=second, ...
 
-        for source in sources.into_iter().filter(|source| {
-            source.name.eq_ignore_ascii_case("xiaowo")
-                || source.file_name.eq_ignore_ascii_case("xiaowo")
-        }) {
+        for source in sources.iter() {
             let Some(meta) = meta_map.get(&source.id).cloned() else {
                 continue;
             };
-            let results = search_via_xiaowo_pages(&client, &meta, keyword, page_start, 3).await;
+            let adapter = match &meta.adapter {
+                Some(a) => a,
+                _ => continue,
+            };
+            let results: Vec<SongResult> = match adapter {
+                NativeSourceAdapter::Xiaowo => {
+                    search_via_xiaowo_pages(&client, &meta, keyword, batch_index * 3, 3).await
+                }
+                NativeSourceAdapter::Kugou => {
+                    let page_start = batch_index * 3 + 1; // pages 4,7,10,...
+                    let mut r = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    for page in page_start..page_start + 3 {
+                        let Ok(resp) = client
+                            .get("http://mobilecdn.kugou.com/api/v3/search/song")
+                            .query(&[
+                                ("format", "json"),
+                                ("keyword", keyword),
+                                ("page", &page.to_string()),
+                                ("pagesize", "100"),
+                                ("showtype", "1"),
+                            ])
+                            .timeout(Duration::from_secs(4))
+                            .send()
+                            .await
+                        else {
+                            continue;
+                        };
+                        let Ok(json) = resp.json::<serde_json::Value>().await else {
+                            continue;
+                        };
+                        let Some(songs) = json
+                            .get("data")
+                            .and_then(|d| d.get("info"))
+                            .and_then(|v| v.as_array())
+                        else {
+                            break;
+                        };
+                        let mut has_data = false;
+                        for item in songs {
+                            let hash = item
+                                .get("hash")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if hash.is_empty() || !seen.insert(hash.clone()) {
+                                continue;
+                            }
+                            has_data = true;
+                            let title = item
+                                .get("songname")
+                                .or_else(|| item.get("filename"))
+                                .map(json_value_to_string)
+                                .unwrap_or_default();
+                            let artist = item
+                                .get("singername")
+                                .or_else(|| item.get("singer"))
+                                .map(json_value_to_string)
+                                .unwrap_or_default();
+                            let album = item
+                                .get("album_name")
+                                .map(json_value_to_string)
+                                .filter(|v| !v.is_empty());
+                            let duration = item
+                                .get("duration")
+                                .or_else(|| item.get("second"))
+                                .and_then(|v| v.as_f64())
+                                .map(|s| s.max(30.0));
+                            let cover_url = item
+                                .get("img")
+                                .or_else(|| item.get("album_img"))
+                                .or_else(|| item.get("cover"))
+                                .map(json_value_to_string)
+                                .filter(|v| !v.is_empty());
+                            let quality = kugou_quality_from_item(item);
+                            r.push(SongResult {
+                                id: hash,
+                                title,
+                                artist,
+                                source: "kugou".to_string(),
+                                source_id: 0,
+                                platform: "kg".to_string(),
+                                album,
+                                cover_url,
+                                duration,
+                                score: 0,
+                                quality,
+                            });
+                        }
+                        if !has_data {
+                            break;
+                        }
+                    }
+                    r
+                }
+                NativeSourceAdapter::Netease => {
+                    let offset_start = batch_index * 300; // offsets 300,600,900,...
+                    let mut r = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    for off in (offset_start..offset_start + 300).step_by(100) {
+                        let Ok(resp) = client
+                            .get("http://music.163.com/api/search/get/")
+                            .query(&[
+                                ("s", keyword),
+                                ("type", "1"),
+                                ("offset", &off.to_string()),
+                                ("limit", "100"),
+                            ])
+                            .header("Referer", "https://music.163.com/")
+                            .header(
+                                "User-Agent",
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                            )
+                            .timeout(Duration::from_secs(4))
+                            .send()
+                            .await
+                        else {
+                            continue;
+                        };
+                        let Ok(json) = resp.json::<serde_json::Value>().await else {
+                            continue;
+                        };
+                        let Some(songs) = json
+                            .get("result")
+                            .and_then(|r| r.get("songs"))
+                            .and_then(|v| v.as_array())
+                        else {
+                            break;
+                        };
+                        let mut has_data = false;
+                        for item in songs {
+                            let id = item.get("id").map(|v| v.to_string()).unwrap_or_default();
+                            if id.is_empty() || !seen.insert(id.clone()) {
+                                continue;
+                            }
+                            has_data = true;
+                            let title = item
+                                .get("name")
+                                .map(json_value_to_string)
+                                .unwrap_or_default();
+                            let artists: Vec<String> = item
+                                .get("artists")
+                                .or_else(|| item.get("ar"))
+                                .and_then(|v| v.as_array())
+                                .map(|arr| {
+                                    arr.iter()
+                                        .filter_map(|a| {
+                                            a.get("name").and_then(|n| n.as_str().map(String::from))
+                                        })
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            let album = item
+                                .get("album")
+                                .or_else(|| item.get("al"))
+                                .and_then(|a| a.get("name"))
+                                .map(json_value_to_string);
+                            let cover_url = item
+                                .get("album")
+                                .or_else(|| item.get("al"))
+                                .and_then(|a| {
+                                    a.get("picUrl")
+                                        .or_else(|| a.get("picurl"))
+                                        .or_else(|| a.get("pic"))
+                                })
+                                .map(json_value_to_string);
+                            let duration = item
+                                .get("duration")
+                                .or_else(|| item.get("dt"))
+                                .and_then(|v| v.as_f64())
+                                .map(|ms| ms / 1000.0)
+                                .filter(|&s| s > 10.0);
+                            let quality = netease_quality_from_item(item);
+                            r.push(SongResult {
+                                id,
+                                title,
+                                artist: artists.join(" / "),
+                                source: "netease".to_string(),
+                                source_id: 0,
+                                platform: "wy".to_string(),
+                                album,
+                                cover_url,
+                                duration,
+                                score: 0,
+                                quality,
+                            });
+                        }
+                        if !has_data {
+                            break;
+                        }
+                    }
+                    r
+                }
+                NativeSourceAdapter::Bilibili => {
+                    let page_start = batch_index * 3 + 1; // pages 4,7,10,...
+                    let mut r = Vec::new();
+                    let mut seen = std::collections::HashSet::new();
+                    for page in page_start..page_start + 3 {
+                        let Ok(resp) = client
+                            .get("https://api.bilibili.com/x/web-interface/search/type")
+                            .query(&[
+                                ("search_type", "video"),
+                                ("keyword", keyword),
+                                ("page", &page.to_string()),
+                            ])
+                            .header("Referer", "https://www.bilibili.com/")
+                            .header(
+                                "User-Agent",
+                                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                            )
+                            .timeout(Duration::from_secs(4))
+                            .send()
+                            .await
+                        else {
+                            continue;
+                        };
+                        let Ok(json) = resp.json::<serde_json::Value>().await else {
+                            continue;
+                        };
+                        let Some(videos) = json
+                            .get("data")
+                            .and_then(|d| d.get("result"))
+                            .and_then(|v| v.as_array())
+                        else {
+                            break;
+                        };
+                        let mut has_data = false;
+                        for item in videos {
+                            let bvid = item
+                                .get("bvid")
+                                .map(json_value_to_string)
+                                .or_else(|| item.get("aid").map(|v| v.to_string()))
+                                .unwrap_or_default();
+                            if bvid.is_empty() || !seen.insert(bvid.clone()) {
+                                continue;
+                            }
+                            has_data = true;
+                            let title = item
+                                .get("title")
+                                .map(json_value_to_string)
+                                .unwrap_or_default();
+                            let author = item
+                                .get("author")
+                                .map(json_value_to_string)
+                                .unwrap_or_default();
+                            let cover_url = item
+                                .get("pic")
+                                .or_else(|| item.get("cover"))
+                                .map(json_value_to_string);
+                            let duration = item.get("duration").and_then(|v| v.as_f64());
+                            if !title.is_empty() {
+                                r.push(SongResult {
+                                    id: bvid,
+                                    title,
+                                    artist: author,
+                                    source: "bilibili".to_string(),
+                                    source_id: 0,
+                                    platform: "bilibili".to_string(),
+                                    album: None,
+                                    cover_url,
+                                    duration,
+                                    score: 0,
+                                    quality: None,
+                                });
+                            }
+                        }
+                        if !has_data {
+                            break;
+                        }
+                    }
+                    r
+                }
+            };
             for mut item in results {
                 item.source_id = source.id;
                 item.score = source.score;
@@ -362,7 +636,7 @@ impl SourceEngine {
         SearchResponse {
             total: all_results.len(),
             results: all_results,
-            from_source: Some("xiaowo".to_string()),
+            from_source: None,
             elapsed_ms: start.elapsed().as_millis() as u64,
         }
     }
@@ -417,6 +691,9 @@ impl SourceEngine {
                     Some(NativeSourceAdapter::Xiaowo) => {
                         search_via_xiaowo(&client, &meta, &kw).await
                     }
+                    Some(NativeSourceAdapter::Kugou) => search_via_kugou(&client, &kw).await,
+                    Some(NativeSourceAdapter::Netease) => search_via_netease(&client, &kw).await,
+                    Some(NativeSourceAdapter::Bilibili) => search_via_bilibili(&client, &kw).await,
                     None => search_via_lxmusic(&client, &meta, &kw).await,
                 }
             };
@@ -447,7 +724,12 @@ impl SourceEngine {
 
         let mut remaining_sources = sources
             .into_iter()
-            .filter(|source| !searched_source_ids.contains(&source.id))
+            .filter(|source| {
+                !searched_source_ids.contains(&source.id)
+                    && meta_map
+                        .get(&source.id)
+                        .is_some_and(|meta| meta.adapter.is_some() || meta.can_search)
+            })
             .collect::<Vec<_>>();
         remaining_sources.sort_by(|a, b| b.score.cmp(&a.score));
 
@@ -457,6 +739,10 @@ impl SourceEngine {
                 let Some(meta) = meta_map.get(&source.id).cloned() else {
                     continue;
                 };
+                if meta.adapter.is_none() && !meta.can_search {
+                    println!("Skip non-search source {}", source.name);
+                    continue;
+                }
                 let client = client.clone();
                 let kw = kw.clone();
                 tasks.push(tokio::spawn(async move {
@@ -464,6 +750,15 @@ impl SourceEngine {
                         match meta.adapter {
                             Some(NativeSourceAdapter::Xiaowo) => {
                                 search_via_xiaowo(&client, &meta, &kw).await
+                            }
+                            Some(NativeSourceAdapter::Kugou) => {
+                                search_via_kugou(&client, &kw).await
+                            }
+                            Some(NativeSourceAdapter::Netease) => {
+                                search_via_netease(&client, &kw).await
+                            }
+                            Some(NativeSourceAdapter::Bilibili) => {
+                                search_via_bilibili(&client, &kw).await
                             }
                             None => search_via_lxmusic(&client, &meta, &kw).await,
                         }
@@ -526,25 +821,26 @@ impl SourceEngine {
         );
         let client = self.http_client.clone();
 
-        let tasks: Vec<_> = meta_map
-            .into_iter()
-            .filter_map(|(id, meta)| {
-                if meta.adapter.is_some() || meta.api_url.is_empty() {
-                    return None;
-                }
-                let client = client.clone();
-                Some(tokio::spawn(async move {
-                    let items = hot_via_lxmusic(&client, &meta).await;
-                    (id, meta.name, items)
-                }))
-            })
-            .collect();
+        // Use FuturesUnordered for true racing — process results as they arrive
+        let mut tasks = FuturesUnordered::new();
+        for (id, meta) in meta_map.iter() {
+            if meta.adapter.is_some() || meta.api_url.is_empty() {
+                continue;
+            }
+            let meta = meta.clone();
+            let id = *id;
+            let client = client.clone();
+            tasks.push(tokio::spawn(async move {
+                let items = hot_via_lxmusic(&client, &meta).await;
+                (id, meta.name.clone(), items)
+            }));
+        }
 
         let mut results = Vec::new();
-        for task in tasks {
-            // Add per-task timeout so slow sources don't block everything
-            match tokio::time::timeout(std::time::Duration::from_secs(3), task).await {
-                Ok(Ok((id, name, items))) => {
+        let target = limit * 2;
+        while let Some(result) = tasks.next().await {
+            match result {
+                Ok((id, name, items)) if !items.is_empty() => {
                     println!("Source {}: found {} hot keywords", name, items.len());
                     for item in items {
                         results.push(HotItem {
@@ -554,36 +850,34 @@ impl SourceEngine {
                         });
                     }
                 }
-                Ok(Err(e)) => {
+                Ok(_) => {} // empty results, ignore silently
+                Err(e) => {
                     println!("Hot keywords task error: {:?}", e);
                 }
-                Err(_) => {
-                    println!("Hot keywords task timeout");
-                }
             }
-            // Return early if we have enough results
-            if results.len() >= limit * 2 {
+            // Return early as soon as we have enough
+            if results.len() >= target {
                 break;
             }
         }
 
         if results.is_empty() {
-            let metas = self.meta_map.lock().unwrap().clone();
-            for (id, meta) in metas {
+            // Fallback: use xiaowo rankings
+            for (id, meta) in meta_map.iter() {
                 if !matches!(meta.adapter, Some(NativeSourceAdapter::Xiaowo)) {
                     continue;
                 }
                 let client = self.http_client.clone();
                 if let Ok(rankings) = tokio::time::timeout(
                     Duration::from_secs(3),
-                    fetch_xiaowo_rankings(&client, id, &meta.name),
+                    fetch_xiaowo_rankings(&client, *id, &meta.name),
                 )
                 .await
                 {
                     for ranking in rankings.into_iter().take(2) {
                         if let Ok(songs) = tokio::time::timeout(
                             Duration::from_secs(4),
-                            fetch_xiaowo_ranking_songs(&client, id, &ranking.id),
+                            fetch_xiaowo_ranking_songs(&client, *id, &ranking.id),
                         )
                         .await
                         {
@@ -592,7 +886,7 @@ impl SourceEngine {
                                 results.push(HotItem {
                                     title: song.title,
                                     source: meta.name.clone(),
-                                    source_id: id,
+                                    source_id: *id,
                                 });
                             }
                         }
@@ -624,7 +918,7 @@ impl SourceEngine {
             Some(NativeSourceAdapter::Xiaowo) => {
                 fetch_xiaowo_rankings(&client, source_id, &meta.name).await
             }
-            None => fetch_rankings(&client, &meta, source_id).await,
+            _ => vec![],
         }
     }
 
@@ -651,7 +945,7 @@ impl SourceEngine {
                         Some(NativeSourceAdapter::Xiaowo) => {
                             fetch_xiaowo_rankings(&client, source.id, &meta.name).await
                         }
-                        None => fetch_rankings(&client, &meta, source.id).await,
+                        _ => vec![],
                     }
                 };
                 tokio::time::timeout(Duration::from_secs(4), fetch)
@@ -685,7 +979,7 @@ impl SourceEngine {
             Some(NativeSourceAdapter::Xiaowo) => {
                 fetch_xiaowo_ranking_songs(&client, source_id, ranking_id).await
             }
-            None => fetch_ranking_songs(&client, &meta, source_id, ranking_id).await,
+            _ => vec![],
         }
     }
 
@@ -701,7 +995,7 @@ impl SourceEngine {
             Some(NativeSourceAdapter::Xiaowo) => {
                 fetch_xiaowo_playlists(&client, source_id, &meta.name).await
             }
-            None => fetch_playlists(&client, &meta, source_id).await,
+            _ => vec![],
         }
     }
 
@@ -728,7 +1022,7 @@ impl SourceEngine {
                         Some(NativeSourceAdapter::Xiaowo) => {
                             fetch_xiaowo_playlists(&client, source.id, &meta.name).await
                         }
-                        None => fetch_playlists(&client, &meta, source.id).await,
+                        _ => vec![],
                     }
                 };
                 tokio::time::timeout(Duration::from_secs(4), fetch)
@@ -762,7 +1056,7 @@ impl SourceEngine {
             Some(NativeSourceAdapter::Xiaowo) => {
                 fetch_xiaowo_playlist_songs(&client, source_id, playlist_id).await
             }
-            None => fetch_playlist_songs(&client, &meta, source_id, playlist_id).await,
+            _ => vec![],
         }
     }
 
@@ -781,6 +1075,9 @@ impl SourceEngine {
         let client = self.http_client.clone();
         let direct = match meta.adapter {
             Some(NativeSourceAdapter::Xiaowo) => fetch_xiaowo_song_url(&client, song_id).await,
+            Some(NativeSourceAdapter::Kugou) => fetch_kugou_song_url(&client, song_id).await,
+            Some(NativeSourceAdapter::Netease) => fetch_netease_song_url(&client, song_id).await,
+            Some(NativeSourceAdapter::Bilibili) => fetch_bilibili_song_url(&client, song_id).await,
             None => fetch_song_url(&client, &meta, platform, song_id).await,
         }?;
         materialize_song_url(&client, &self.audio_cache_dir, direct).await
@@ -801,6 +1098,9 @@ impl SourceEngine {
         let client = self.http_client.clone();
         let mut result = match meta.adapter {
             Some(NativeSourceAdapter::Xiaowo) => fetch_xiaowo_song_info(&client, song_id).await,
+            Some(NativeSourceAdapter::Kugou) => fetch_kugou_song_info(&client, song_id).await,
+            Some(NativeSourceAdapter::Netease) => fetch_netease_song_info(&client, song_id).await,
+            Some(NativeSourceAdapter::Bilibili) => None,
             None => fetch_song_info(&client, &meta, source_id, platform, song_id).await,
         };
         if platform == "kw"
@@ -885,14 +1185,39 @@ fn parse_source_content(content: &str, file_name: &str) -> (String, Option<Sourc
                 api_key: String::new(),
                 platforms: vec!["kw".to_string()],
                 adapter: Some(NativeSourceAdapter::Xiaowo),
+                can_search: true,
             }),
         );
     }
 
+    // Native adapters for other platforms (detected by file_name prefix)
+    let native_adapter = detect_native_adapter(file_name);
+    if let Some(adapter) = native_adapter {
+        let plat = match adapter {
+            NativeSourceAdapter::Kugou => vec!["kg".to_string()],
+            NativeSourceAdapter::Netease => vec!["wy".to_string()],
+            NativeSourceAdapter::Bilibili => vec!["bilibili".to_string()],
+            _ => vec!["kw".to_string()],
+        };
+        println!("Parsed source '{}': native adapter={:?}", name, adapter);
+        return (
+            name.clone(),
+            Some(SourceMeta {
+                name,
+                api_url: String::new(),
+                api_key: String::new(),
+                platforms: plat,
+                adapter: Some(adapter),
+                can_search: true,
+            }),
+        );
+    }
+
+    let can_search = source_supports_search(content);
     let meta = api_url.map(|url| {
         println!(
-            "Parsed source '{}': API_URL={}, platforms={:?}",
-            name, url, platforms
+            "Parsed source '{}': API_URL={}, platforms={:?}, can_search={}",
+            name, url, platforms, can_search
         );
         SourceMeta {
             name: name.clone(),
@@ -900,10 +1225,39 @@ fn parse_source_content(content: &str, file_name: &str) -> (String, Option<Sourc
             api_key: api_key.unwrap_or_default(),
             platforms,
             adapter: None,
+            can_search,
         }
     });
 
     (name, meta)
+}
+
+fn detect_native_adapter(file_name: &str) -> Option<NativeSourceAdapter> {
+    let lower = file_name.to_ascii_lowercase();
+    if lower.contains("kugou") || lower.contains("kg_") || lower == "kg.js" {
+        Some(NativeSourceAdapter::Kugou)
+    } else if lower.contains("netease")
+        || lower.contains("wangyi")
+        || lower.contains("wy_")
+        || lower == "wy.js"
+    {
+        Some(NativeSourceAdapter::Netease)
+    } else if lower.contains("bilibili") || lower.contains("bili") {
+        Some(NativeSourceAdapter::Bilibili)
+    } else {
+        None
+    }
+}
+
+fn source_supports_search(content: &str) -> bool {
+    let lower = content.to_ascii_lowercase();
+    lower.contains("/api/v1/search")
+        || lower.contains("case 'search'")
+        || lower.contains("case \"search\"")
+        || lower.contains("case 'musicsearch'")
+        || lower.contains("case \"musicsearch\"")
+        || lower.contains("searchmusic")
+        || lower.contains("musicsearch")
 }
 
 /// Extract a JS variable value (const/let/var NAME = value)
@@ -1761,10 +2115,12 @@ async fn fetch_xiaowo_rankings(
                         .or_else(|| item.get("disname"))
                         .map(json_value_to_string)
                         .unwrap_or_default();
+                    let cover = extract_cover_url(item);
                     if !id.is_empty() && !name.is_empty() {
                         out.push(RankingCategory {
                             id,
                             name,
+                            cover,
                             source_id,
                             source_name: source_name.to_string(),
                         });
@@ -1822,62 +2178,82 @@ async fn fetch_xiaowo_playlists(
     source_id: usize,
     source_name: &str,
 ) -> Vec<PlaylistInfo> {
-    let response = client
-        .get("https://wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList")
-        .query(&[
-            ("loginUid", "0"),
-            ("loginSid", "0"),
-            ("appUid", "76039576"),
-            ("pn", "0"),
-            ("rn", "30"),
-            ("order", "hot"),
-        ])
-        .timeout(Duration::from_secs(5))
-        .send()
-        .await;
-    let Ok(response) = response else {
-        return Vec::new();
-    };
-    let Ok(json) = response.json::<serde_json::Value>().await else {
-        return Vec::new();
-    };
-    let items = json
-        .get("data")
-        .and_then(|value| value.get("data"))
-        .or_else(|| json.get("data"))
-        .and_then(|value| value.as_array());
-    items
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(|item| {
-                    let id = item.get("id").map(json_value_to_string).unwrap_or_default();
-                    let name = item
-                        .get("name")
-                        .or_else(|| item.get("title"))
-                        .map(json_value_to_string)
-                        .unwrap_or_default();
-                    if id.is_empty() || name.is_empty() {
-                        return None;
-                    }
-                    Some(PlaylistInfo {
-                        id,
-                        name,
-                        cover: item
-                            .get("img")
-                            .or_else(|| item.get("pic"))
-                            .or_else(|| item.get("cover"))
-                            .map(json_value_to_string)
-                            .map(normalize_cover_url)
-                            .filter(|value| !value.is_empty()),
-                        song_count: None,
-                        source_id,
-                        source_name: source_name.to_string(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+    let mut all = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Fetch 6 pages (up to 180 playlists)
+    for pn in 0..6 {
+        let response = client
+            .get("https://wapi.kuwo.cn/api/pc/classify/playlist/getRcmPlayList")
+            .query(&[
+                ("loginUid", "0"),
+                ("loginSid", "0"),
+                ("appUid", "76039576"),
+                ("pn", &pn.to_string()),
+                ("rn", "30"),
+                ("order", "hot"),
+            ])
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await;
+        let Ok(response) = response else {
+            break;
+        };
+        let Ok(json) = response.json::<serde_json::Value>().await else {
+            break;
+        };
+        let items = json
+            .get("data")
+            .and_then(|value| value.get("data"))
+            .or_else(|| json.get("data"))
+            .and_then(|value| value.as_array());
+        let Some(items) = items else { break };
+
+        let mut page_count = 0;
+        for item in items {
+            let id = item.get("id").map(json_value_to_string).unwrap_or_default();
+            let name = item
+                .get("name")
+                .or_else(|| item.get("title"))
+                .map(json_value_to_string)
+                .unwrap_or_default();
+            if id.is_empty() || name.is_empty() || !seen.insert(id.clone()) {
+                continue;
+            }
+            page_count += 1;
+            all.push(PlaylistInfo {
+                id,
+                name,
+                cover: item
+                    .get("img")
+                    .or_else(|| item.get("pic"))
+                    .or_else(|| item.get("cover"))
+                    .map(json_value_to_string)
+                    .map(normalize_cover_url)
+                    .filter(|value| !value.is_empty()),
+                song_count: None,
+                source_id,
+                source_name: source_name.to_string(),
+            });
+        }
+        // If page returned fewer than expected, no more pages
+        if page_count < 25 {
+            break;
+        }
+    }
+
+    println!(
+        "xiaowo playlists: fetched {} total from {} pages",
+        all.len(),
+        if all.len() > 60 {
+            3
+        } else if all.len() > 30 {
+            2
+        } else {
+            1
+        }
+    );
+    all
 }
 
 async fn fetch_xiaowo_playlist_songs(
@@ -1917,6 +2293,520 @@ async fn fetch_xiaowo_playlist_songs(
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// ─── Kugou native adapter ───
+
+async fn search_via_kugou(client: &reqwest::Client, keyword: &str) -> Vec<SongResult> {
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for page in 1..=3 {
+        let response = client
+            .get("http://mobilecdn.kugou.com/api/v3/search/song")
+            .query(&[
+                ("format", "json"),
+                ("keyword", keyword),
+                ("page", &page.to_string()),
+                ("pagesize", "100"),
+                ("showtype", "1"),
+            ])
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await;
+        let Ok(response) = response else {
+            continue;
+        };
+        let Ok(json) = response.json::<serde_json::Value>().await else {
+            continue;
+        };
+        let songs = json
+            .get("data")
+            .and_then(|d| d.get("info"))
+            .and_then(|v| v.as_array());
+        let Some(songs) = songs else {
+            continue;
+        };
+        let mut has_data = false;
+        for item in songs {
+            let hash = item
+                .get("hash")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if hash.is_empty() || !seen.insert(hash.clone()) {
+                continue;
+            }
+            has_data = true;
+            let title = item
+                .get("songname")
+                .or_else(|| item.get("filename"))
+                .map(json_value_to_string)
+                .unwrap_or_default();
+            let artist = item
+                .get("singername")
+                .or_else(|| item.get("singer"))
+                .map(json_value_to_string)
+                .unwrap_or_default();
+            let album = item
+                .get("album_name")
+                .map(json_value_to_string)
+                .filter(|v| !v.is_empty());
+            let duration = item
+                .get("duration")
+                .or_else(|| item.get("second"))
+                .and_then(|v| v.as_f64())
+                .map(|s| s.max(30.0));
+            let cover_url = item
+                .get("img")
+                .or_else(|| item.get("album_img"))
+                .or_else(|| item.get("cover"))
+                .map(json_value_to_string)
+                .filter(|v| !v.is_empty());
+            // Kugou quality: sqfilesize → flac, hqfilesize → 320k, filesize → 128k
+            let quality = kugou_quality_from_item(item);
+            results.push(SongResult {
+                id: hash,
+                title,
+                artist,
+                source: "kugou".to_string(),
+                source_id: 0,
+                platform: "kg".to_string(),
+                album,
+                cover_url,
+                duration,
+                score: 0,
+                quality,
+            });
+        }
+        if !has_data {
+            break;
+        }
+    }
+    results
+}
+
+async fn fetch_kugou_song_url(client: &reqwest::Client, song_id: &str) -> Option<SongUrlResult> {
+    let response = client
+        .get("http://trackercdn.kugou.com/i/v2/")
+        .query(&[
+            ("key", song_id),
+            ("pid", "2"),
+            ("behavior", "play"),
+            ("cmd", "26"),
+            ("version", "9108"),
+            ("br", "320"),
+        ])
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+    let json = response.json::<serde_json::Value>().await.ok()?;
+    let play_url = json
+        .get("url")
+        .or_else(|| json.get("play_url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if play_url.is_empty() || play_url == "null" {
+        return None;
+    }
+    Some(SongUrlResult {
+        url: play_url.to_string(),
+        quality: "320k".to_string(),
+        format: "mp3".to_string(),
+    })
+}
+
+async fn fetch_kugou_song_info(client: &reqwest::Client, song_id: &str) -> Option<SongInfoResult> {
+    let response = client
+        .get("http://m.kugou.com/app/i/getSongInfo.php")
+        .query(&[("cmd", "playInfo"), ("hash", song_id)])
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+    let json = response.json::<serde_json::Value>().await.ok()?;
+    let title = json
+        .get("songName")
+        .or_else(|| json.get("name"))
+        .map(json_value_to_string)
+        .unwrap_or_default();
+    let artist = json
+        .get("singerName")
+        .or_else(|| json.get("singer"))
+        .or_else(|| json.get("author"))
+        .map(json_value_to_string)
+        .unwrap_or_default();
+    let cover_url = json
+        .get("imgUrl")
+        .or_else(|| json.get("cover"))
+        .map(json_value_to_string)
+        .unwrap_or_default();
+    // Fetch lyrics from URL
+    let lyrics = if let Some(lyric_url) = json
+        .get("lyrics")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    {
+        if let Ok(r) = client
+            .get(lyric_url)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
+            r.text().await.ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Some(SongInfoResult {
+        id: song_id.to_string(),
+        title,
+        artist,
+        album: json.get("album_name").map(json_value_to_string),
+        cover_url: Some(cover_url).filter(|v| !v.is_empty()),
+        lyrics,
+        duration: None,
+        platform: "kg".to_string(),
+    })
+}
+
+// ─── Netease native adapter ───
+
+async fn search_via_netease(client: &reqwest::Client, keyword: &str) -> Vec<SongResult> {
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for offset in (0..3).map(|i| i * 100) {
+        let response = client
+            .get("http://music.163.com/api/search/get/")
+            .query(&[
+                ("s", keyword),
+                ("type", "1"),
+                ("offset", &offset.to_string()),
+                ("limit", "100"),
+            ])
+            .header("Referer", "https://music.163.com/")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            )
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await;
+        let Ok(response) = response else {
+            continue;
+        };
+        let Ok(json) = response.json::<serde_json::Value>().await else {
+            continue;
+        };
+        let songs = json
+            .get("result")
+            .and_then(|r| r.get("songs"))
+            .and_then(|v| v.as_array());
+        let Some(songs) = songs else {
+            break;
+        };
+        let mut has_data = false;
+        for item in songs {
+            let id = item.get("id").map(|v| v.to_string()).unwrap_or_default();
+            if id.is_empty() || !seen.insert(id.clone()) {
+                continue;
+            }
+            has_data = true;
+            let title = item
+                .get("name")
+                .map(json_value_to_string)
+                .unwrap_or_default();
+            let artists: Vec<String> = item
+                .get("artists")
+                .or_else(|| item.get("ar"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| a.get("name").and_then(|n| n.as_str().map(String::from)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let album = item
+                .get("album")
+                .or_else(|| item.get("al"))
+                .and_then(|a| a.get("name"))
+                .map(json_value_to_string);
+            let cover_url = item
+                .get("album")
+                .or_else(|| item.get("al"))
+                .and_then(|a| {
+                    a.get("picUrl")
+                        .or_else(|| a.get("picurl"))
+                        .or_else(|| a.get("pic"))
+                })
+                .map(json_value_to_string);
+            let duration = item
+                .get("duration")
+                .or_else(|| item.get("dt"))
+                .and_then(|v| v.as_f64())
+                .map(|ms| ms / 1000.0)
+                .filter(|&s| s > 10.0);
+            let quality = netease_quality_from_item(item);
+            results.push(SongResult {
+                id,
+                title,
+                artist: artists.join(" / "),
+                source: "netease".to_string(),
+                source_id: 0,
+                platform: "wy".to_string(),
+                album,
+                cover_url,
+                duration,
+                score: 0,
+                quality,
+            });
+        }
+        if !has_data {
+            break;
+        }
+    }
+    results
+}
+
+async fn fetch_netease_song_url(client: &reqwest::Client, song_id: &str) -> Option<SongUrlResult> {
+    let response = client
+        .get("http://music.163.com/api/song/enhance/player/url")
+        .query(&[
+            ("id", song_id),
+            ("ids", &format!("[{}]", song_id)),
+            ("br", "320000"),
+        ])
+        .header("Referer", "https://music.163.com/")
+        .header(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        )
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await
+        .ok()?;
+    let json = response.json::<serde_json::Value>().await.ok()?;
+    let data = json.get("data").and_then(|d| d.as_array())?.first()?;
+    let play_url = data.get("url").and_then(|v| v.as_str()).unwrap_or("");
+    if play_url.is_empty() || play_url.contains("null") {
+        return None;
+    }
+    let br = data.get("br").and_then(|v| v.as_f64()).unwrap_or(320000.0);
+    let quality = if br >= 320000.0 {
+        "320k"
+    } else if br >= 128000.0 {
+        "128k"
+    } else {
+        "mp3"
+    };
+    Some(SongUrlResult {
+        url: play_url.to_string(),
+        quality: quality.to_string(),
+        format: "mp3".to_string(),
+    })
+}
+
+async fn fetch_netease_song_info(
+    client: &reqwest::Client,
+    song_id: &str,
+) -> Option<SongInfoResult> {
+    let resp = client
+        .get(&format!(
+            "http://music.163.com/api/song/lyric?id={}&lv=-1&kv=-1&tv=-1",
+            song_id
+        ))
+        .header("Referer", "https://music.163.com/")
+        .header("User-Agent", "Mozilla/5.0")
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+    let json = resp.json::<serde_json::Value>().await.ok()?;
+    let lyrics = json
+        .get("lrc")
+        .and_then(|l| l.get("lyric"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    // Fetch song detail (title/artist/cover)
+    let detail_json = client
+        .get(&format!(
+            "http://music.163.com/api/song/detail?id={}&ids=[{}]",
+            song_id, song_id
+        ))
+        .header("Referer", "https://music.163.com/")
+        .timeout(Duration::from_secs(3))
+        .send()
+        .await
+        .ok();
+    let detail = if let Some(resp) = detail_json {
+        resp.json::<serde_json::Value>().await.ok()
+    } else {
+        None
+    };
+    let (title, artist, cover) = detail
+        .and_then(|d| {
+            d.get("songs")
+                .and_then(|s| s.as_array())
+                .and_then(|a| a.first().cloned())
+        })
+        .map(|s| {
+            let t = s.get("name").map(json_value_to_string).unwrap_or_default();
+            let a: Vec<String> = s
+                .get("artists")
+                .or_else(|| s.get("ar"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|a| a.get("name").and_then(|n| n.as_str().map(String::from)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let c = s
+                .get("album")
+                .and_then(|al| al.get("picUrl").or_else(|| al.get("picurl")))
+                .map(json_value_to_string);
+            (t, a.join(" / "), c)
+        })
+        .unwrap_or_default();
+    Some(SongInfoResult {
+        id: song_id.to_string(),
+        title,
+        artist,
+        album: None,
+        cover_url: cover,
+        lyrics,
+        duration: None,
+        platform: "wy".to_string(),
+    })
+}
+
+// ─── Bilibili native adapter ───
+
+async fn search_via_bilibili(client: &reqwest::Client, keyword: &str) -> Vec<SongResult> {
+    let mut results = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for page in 1..=3 {
+        let response = client
+            .get("https://api.bilibili.com/x/web-interface/search/type")
+            .query(&[
+                ("search_type", "video"),
+                ("keyword", keyword),
+                ("page", &page.to_string()),
+            ])
+            .header("Referer", "https://www.bilibili.com/")
+            .header(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            )
+            .timeout(Duration::from_secs(4))
+            .send()
+            .await;
+        let Ok(response) = response else {
+            continue;
+        };
+        let Ok(json) = response.json::<serde_json::Value>().await else {
+            continue;
+        };
+        let videos = json
+            .get("data")
+            .and_then(|d| d.get("result"))
+            .and_then(|v| v.as_array());
+        let Some(videos) = videos else {
+            break;
+        };
+        let mut has_data = false;
+        for item in videos {
+            let bvid = item
+                .get("bvid")
+                .map(json_value_to_string)
+                .or_else(|| item.get("aid").map(|v| v.to_string()))
+                .unwrap_or_default();
+            if bvid.is_empty() || !seen.insert(bvid.clone()) {
+                continue;
+            }
+            has_data = true;
+            let title = item
+                .get("title")
+                .map(json_value_to_string)
+                .unwrap_or_default();
+            let author = item
+                .get("author")
+                .map(json_value_to_string)
+                .unwrap_or_default();
+            let cover_url = item
+                .get("pic")
+                .or_else(|| item.get("cover"))
+                .map(json_value_to_string);
+            let duration = item.get("duration").and_then(|v| v.as_f64());
+            if !title.is_empty() {
+                results.push(SongResult {
+                    id: bvid,
+                    title,
+                    artist: author,
+                    source: "bilibili".to_string(),
+                    source_id: 0,
+                    platform: "bilibili".to_string(),
+                    album: None,
+                    cover_url,
+                    duration,
+                    score: 0,
+                    quality: None,
+                });
+            }
+        }
+        if !has_data {
+            break;
+        }
+    }
+    results
+}
+
+async fn fetch_bilibili_song_url(client: &reqwest::Client, bvid: &str) -> Option<SongUrlResult> {
+    let resp = client
+        .get(&format!(
+            "https://api.bilibili.com/x/web-interface/view?bvid={}",
+            bvid
+        ))
+        .header("Referer", "https://www.bilibili.com/")
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+    let json = resp.json::<serde_json::Value>().await.ok()?;
+    let cid = json
+        .get("data")
+        .and_then(|d| d.get("cid"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as u64)?;
+    let play_resp = client
+        .get(&format!(
+            "https://api.bilibili.com/x/player/playurl?bvid={}&cid={}&qn=16&type=mp4",
+            bvid, cid
+        ))
+        .header("Referer", "https://www.bilibili.com/")
+        .timeout(Duration::from_secs(4))
+        .send()
+        .await
+        .ok()?;
+    let play_json = play_resp.json::<serde_json::Value>().await.ok()?;
+    let first_url = play_json
+        .get("data")
+        .and_then(|d| d.get("durl"))
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|d| d.get("url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if first_url.is_empty() {
+        return None;
+    }
+    Some(SongUrlResult {
+        url: first_url.to_string(),
+        quality: "mp4".to_string(),
+        format: "mp4".to_string(),
+    })
 }
 
 fn xiaowo_song_detail_from_item(
@@ -2119,12 +3009,67 @@ fn extract_quality_label(item: &serde_json::Value) -> Option<String> {
 }
 
 fn format_bitrate(rate: u32) -> String {
-    if rate >= 1000 {
+    if rate >= 1000000 {
         "Lossless".to_string()
+    } else if rate >= 1000 {
+        // rate in bps like 320000 → "320k"
+        format!("{}k", rate / 1000)
     } else if rate > 0 {
+        // rate in kbps like 320 → "320k"
         format!("{rate}k")
     } else {
         String::new()
+    }
+}
+
+/// Kugou quality: sqfilesize (>0 → flac), hqfilesize (>0 → 320k), filesize (>0 → 128k)
+fn kugou_quality_from_item(item: &serde_json::Value) -> Option<String> {
+    let sq = item
+        .get("sqfilesize")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let hq = item
+        .get("hqfilesize")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let fsize = item
+        .get("filesize")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    if sq > 0 {
+        Some("flac".to_string())
+    } else if hq > 0 {
+        Some("320k".to_string())
+    } else if fsize > 0 {
+        Some("128k".to_string())
+    } else {
+        None
+    }
+}
+
+/// Netease quality: extract from privilege.maxBitrate (in bps)
+fn netease_quality_from_item(item: &serde_json::Value) -> Option<String> {
+    let br = item
+        .get("privilege")
+        .and_then(|p| p.get("maxBitrate").or_else(|| p.get("maxbr")))
+        .and_then(|v| v.as_f64())
+        .map(|b| b as u32)
+        .unwrap_or(0);
+    if br >= 999000 {
+        Some("flac".to_string())
+    } else if br >= 320000 {
+        Some("320k".to_string())
+    } else if br >= 192000 {
+        Some("192k".to_string())
+    } else if br >= 128000 {
+        Some("128k".to_string())
+    } else if br > 0 {
+        Some(format_bitrate(br))
+    } else {
+        None
     }
 }
 
@@ -2307,10 +3252,12 @@ async fn fetch_rankings(
                         .or_else(|| item.get("title"))
                         .and_then(|v| v.as_str())
                         .unwrap_or("");
+                    let cover = extract_cover_url(item);
                     if !id.is_empty() && !name.is_empty() {
                         results.push(RankingCategory {
                             id: id.to_string(),
                             name: name.to_string(),
+                            cover,
                             source_id,
                             source_name: meta.name.clone(),
                         });
@@ -2351,10 +3298,12 @@ async fn fetch_rankings(
                             .or_else(|| item.get("title"))
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
+                        let cover = extract_cover_url(item);
                         if !id.is_empty() && !name.is_empty() {
                             results.push(RankingCategory {
                                 id: id.to_string(),
                                 name: name.to_string(),
+                                cover,
                                 source_id,
                                 source_name: meta.name.clone(),
                             });
@@ -3095,38 +4044,210 @@ async fn fetch_song_info(
     None
 }
 
-pub async fn parse_kugou_shared_playlist(url: &str) -> Result<SharedPlaylist, String> {
-    let normalized_url = normalize_share_url(url)
-        .ok_or_else(|| "没有找到可解析的酷狗歌单链接，请粘贴完整分享链接或接口内容".to_string())?;
-    let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+pub async fn parse_kugou_shared_playlist(input: &str) -> Result<SharedPlaylist, String> {
+    let trimmed = input.trim();
+
+    // 1) Try to parse as direct JSON / HTML text (pasted response body)
+    if let Some(result) = try_parse_pasted_text(trimmed) {
+        return Ok(result);
+    }
+
+    // 2) Otherwise treat as URL
+    let normalized_url = normalize_share_url(trimmed)
+        .ok_or_else(|| "没有找到可解析的酷狗歌单链接或数据，请粘贴完整分享链接、API响应JSON或页面HTML内容".to_string())?;
+    let (songs, final_url, title, cover) = fetch_and_parse_url(&normalized_url).await?;
+
+    let note = if songs.is_empty() {
+        Some("已识别酷狗歌单链接，但页面和公开接口都没有返回可解析歌曲。请确认链接不是私密歌单，或重新复制完整分享链接。如果是在浏览器中登录后复制的页面内容，可以尝试直接粘贴页面HTML。".to_string())
+    } else {
+        None
+    };
+
+    Ok(SharedPlaylist {
+        playlist: PlaylistInfo {
+            id: final_url.clone(),
+            name: title,
+            cover,
+            song_count: Some(songs.len()),
+            source_id: 0,
+            source_name: "酷狗分享".to_string(),
+        },
+        songs,
+        external_url: final_url,
+        note,
+    })
+}
+
+/// Try to parse pasted raw text (JSON API response or HTML) directly
+fn try_parse_pasted_text(text: &str) -> Option<SharedPlaylist> {
+    let trimmed = text.trim();
+    // Reject if it looks like a URL
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return None;
+    }
+    // Reject if it's not JSON/HTML-like at all
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') && !trimmed.contains('<') {
+        return None;
+    }
+
+    let mut songs = extract_kugou_songs_from_text(trimmed);
+    if songs.is_empty() {
+        songs = extract_songs_from_html_lists(trimmed);
+    }
+    if songs.is_empty() {
+        return None;
+    }
+
+    // Try to extract title from JSON data
+    let mut title = "酷狗分享歌单".to_string();
+    let mut external_url = String::new();
+
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        // Try listname from get_other_list_file response
+        if let Some(name) = value
+            .get("data")
+            .and_then(|d| d.get("listname"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            title = name.to_string();
+        }
+        // Extract global_collection_id for external_url
+        if let Some(gcid) = value
+            .get("data")
+            .and_then(|d| d.get("global_collection_id"))
+            .or_else(|| value.get("global_collection_id"))
+            .and_then(|v| v.as_str())
+        {
+            external_url = format!(
+                "https://pubsongscdn.kugou.com/v2/get_other_list_file?type=0&module=playlist&global_collection_id={}",
+                gcid
+            );
+        }
+    }
+
+    Some(SharedPlaylist {
+        playlist: PlaylistInfo {
+            id: external_url.clone(),
+            name: title,
+            cover: extract_first_image(trimmed),
+            song_count: Some(songs.len()),
+            source_id: 0,
+            source_name: "酷狗分享".to_string(),
+        },
+        songs,
+        external_url,
+        note: None,
+    })
+}
+
+/// Build HTTP client with kugou cookies loaded from config
+fn build_kugou_client() -> reqwest::Result<reqwest::Client> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::ACCEPT,
+        "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        reqwest::header::ACCEPT_LANGUAGE,
+        "zh-CN,zh;q=0.9".parse().unwrap(),
+    );
+    headers.insert("sec-ch-ua", r#""Google Chrome";v="149", "Chromium";v="149", "Not)A;Brand";v="24""#.parse().unwrap());
+    headers.insert("sec-ch-ua-platform", "\"Windows\"".parse().unwrap());
+
+    reqwest::Client::builder()
+        .user_agent(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
+        )
+        .default_headers(headers)
         .redirect(reqwest::redirect::Policy::limited(10))
         .timeout(Duration::from_secs(12))
         .build()
-        .map_err(|err| err.to_string())?;
+}
 
-    let text = client
-        .get(&normalized_url)
+/// Load kugou cookies from a local config file
+fn load_kugou_cookie() -> String {
+    // Try kugou_cookies.txt in current directory
+    let config_path = std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("kugou_cookies.txt");
+    if let Ok(content) = fs::read_to_string(&config_path) {
+        let cookie = content.trim().to_string();
+        if !cookie.is_empty() {
+            println!("[parse_kugou] Loaded cookie from kugou_cookies.txt");
+            return cookie;
+        }
+    }
+    // Also try user home directory
+    if let Some(home) = dirs_next_home() {
+        let cookie_file = home.join(".miku_tunes").join("kugou_cookies.txt");
+        if let Ok(content) = fs::read_to_string(&cookie_file) {
+            let cookie = content.trim().to_string();
+            if !cookie.is_empty() {
+                println!("[parse_kugou] Loaded cookie from ~/.miku_tunes/kugou_cookies.txt");
+                return cookie;
+            }
+        }
+    }
+    String::new()
+}
+
+fn dirs_next_home() -> Option<PathBuf> {
+    if cfg!(windows) {
+        std::env::var("USERPROFILE").ok().map(PathBuf::from)
+    } else {
+        std::env::var("HOME").ok().map(PathBuf::from)
+    }
+}
+
+async fn fetch_and_parse_url(url: &str) -> Result<(Vec<SongDetail>, String, String, Option<String>), String> {
+    let client = build_kugou_client().map_err(|err| err.to_string())?;
+
+    let cookie = load_kugou_cookie();
+    let mut req = client.get(url);
+    if !cookie.is_empty() {
+        req = req.header(reqwest::header::COOKIE, &cookie);
+    }
+
+    let response = req
         .send()
         .await
-        .map_err(|err| format!("分享链接访问失败: {err}"))?
+        .map_err(|err| format!("分享链接访问失败: {err}"))?;
+    let final_url = response.url().to_string();
+    let text = response
         .text()
         .await
         .map_err(|err| format!("分享内容读取失败: {err}"))?;
 
     let title = extract_html_title(&text).unwrap_or_else(|| "酷狗分享歌单".to_string());
+    let cover = extract_first_image(&text);
     let mut songs = extract_kugou_songs_from_text(&text);
+
+    // Also try parsing rendered HTML <li> lists
+    if songs.is_empty() {
+        songs = extract_songs_from_html_lists(&text);
+    }
+
     if songs.is_empty() {
         for nested_url in extract_kugou_urls(&text)
             .into_iter()
-            .chain(kugou_playlist_candidate_urls(&normalized_url, &text))
+            .chain(kugou_playlist_candidate_urls(url, &final_url, &text))
         {
-            if nested_url == normalized_url {
+            if nested_url == url || nested_url == final_url {
                 continue;
             }
-            if let Ok(response) = client.get(&nested_url).send().await {
+            let mut req = client.get(&nested_url);
+            if !cookie.is_empty() {
+                req = req.header(reqwest::header::COOKIE, &cookie);
+            }
+            if let Ok(response) = req.send().await {
                 if let Ok(nested_text) = response.text().await {
                     songs = extract_kugou_songs_from_text(&nested_text);
+                    if songs.is_empty() {
+                        songs = extract_songs_from_html_lists(&nested_text);
+                    }
                     if !songs.is_empty() {
                         break;
                     }
@@ -3134,31 +4255,8 @@ pub async fn parse_kugou_shared_playlist(url: &str) -> Result<SharedPlaylist, St
             }
         }
     }
-    let note = if songs.is_empty() {
-        Some("已收藏分享链接，但当前接口没有返回可解析的歌曲列表。".to_string())
-    } else {
-        None
-    };
 
-    let note = if songs.is_empty() {
-        Some("已识别酷狗歌单链接，但页面和公开接口都没有返回可解析歌曲。请确认链接不是私密歌单，或重新复制完整分享链接。".to_string())
-    } else {
-        note
-    };
-
-    Ok(SharedPlaylist {
-        playlist: PlaylistInfo {
-            id: normalized_url.clone(),
-            name: title,
-            cover: extract_first_image(&text),
-            song_count: Some(songs.len()),
-            source_id: 0,
-            source_name: "酷狗分享".to_string(),
-        },
-        songs,
-        external_url: normalized_url,
-        note,
-    })
+    Ok((songs, final_url, title, cover))
 }
 
 fn extract_html_title(text: &str) -> Option<String> {
@@ -3253,13 +4351,15 @@ fn decode_basic_html(value: &str) -> String {
         .replace("&gt;", ">")
 }
 
-fn kugou_playlist_candidate_urls(input_url: &str, text: &str) -> Vec<String> {
+fn kugou_playlist_candidate_urls(input_url: &str, final_url: &str, text: &str) -> Vec<String> {
     let mut urls = Vec::new();
+    push_unique(&mut urls, final_url.to_string());
     for url in extract_kugou_urls(text) {
         push_unique(&mut urls, url);
     }
     for gcid in extract_gcid_values(input_url)
         .into_iter()
+        .chain(extract_gcid_values(final_url))
         .chain(extract_gcid_values(text))
     {
         push_unique(
@@ -3269,6 +4369,7 @@ fn kugou_playlist_candidate_urls(input_url: &str, text: &str) -> Vec<String> {
     }
     for collection_id in extract_collection_ids(text)
         .into_iter()
+        .chain(extract_collection_ids(final_url))
         .chain(extract_collection_ids(input_url))
     {
         push_unique(
@@ -3320,6 +4421,114 @@ where
         rest = &tail[step..];
     }
     values
+}
+
+/// Extract songs from rendered HTML <li> tag format (the songlist page when login cookies work)
+fn extract_songs_from_html_lists(text: &str) -> Vec<SongDetail> {
+    let mut out = Vec::new();
+    let decoded = decode_basic_html(text).replace("\\/", "/");
+
+    // Pattern: <li>...<a title="Artist - Song Name" href="..." data="hash|timelen">...</a>...</li>
+    let mut rest = decoded.as_str();
+    while let Some(li_start) = rest.find("<li>") {
+        let li_tail = &rest[li_start..];
+        let Some(li_end) = li_tail.find("</li>") else {
+            break;
+        };
+        let li_content = &li_tail[..li_end + 5];
+
+        // Extract data attribute: data="HASH|timelen"
+        let hash = extract_html_attr(li_content, r#"data=""#, '"')
+            .and_then(|attr| attr.split('|').next().map(|s| s.to_string()));
+
+        // Extract href for mixsong URL (available for future use)
+        let _mixsong_url = extract_html_attr(li_content, r#"href=""#, '"');
+
+        // Extract title="Artist - Song Title"
+        let title_attr = extract_html_attr(li_content, r#"title=""#, '"')
+            .unwrap_or_default();
+
+        // Parse "Artist - Song Title" from the title attribute
+        let (artist, title) = if let Some(pos) = title_attr.find(" - ") {
+            let artist = title_attr[..pos].trim().to_string();
+            let title = title_attr[pos + 3..].trim().to_string();
+            if !artist.is_empty() && !title.is_empty() {
+                (artist, title)
+            } else {
+                (String::new(), title_attr)
+            }
+        } else {
+            (String::new(), title_attr)
+        };
+
+        // Fallback: try <i> tag content
+        let (fallback_artist, fallback_title) = extract_html_inner_text(li_content, "i");
+        let artist = if artist.is_empty() { fallback_artist } else { artist };
+        let title = if title.is_empty() { fallback_title } else { title };
+
+        if title.is_empty() || title.contains("http") || title.len() > 200 {
+            rest = &rest[li_start + li_end + 5..];
+            continue;
+        }
+
+        let id = hash.unwrap_or_else(|| format!("kg-li-{}-{}", title, artist));
+        let timelen = extract_html_attr(li_content, r#"data=""#, '"')
+            .and_then(|attr| attr.split('|').nth(1).and_then(|s| s.parse::<f64>().ok()));
+
+        out.push(SongDetail {
+            id,
+            title,
+            artist: if artist.is_empty() { "未知歌手".to_string() } else { artist },
+            album: None,
+            album_id: None,
+            cover_url: None,
+            duration: timelen.map(|t| {
+                if t > 10000.0 { t / 1000.0 } else { t }
+            }),
+            source_id: 0,
+            platform: "kg".to_string(),
+        });
+
+        rest = &rest[li_start + li_end + 5..];
+    }
+    dedupe_song_details(out)
+}
+
+/// Extract an HTML attribute value like attr="value"
+fn extract_html_attr(text: &str, prefix: &str, delimiter: char) -> Option<String> {
+    let pos = text.find(prefix)?;
+    let val_start = pos + prefix.len();
+    let val_tail = &text[val_start..];
+    let end = val_tail.find(delimiter)?;
+    let val = &val_tail[..end];
+    let decoded = decode_basic_html(val).trim().to_string();
+    if decoded.is_empty() {
+        None
+    } else {
+        Some(decoded)
+    }
+}
+
+/// Extract inner text of the first matching HTML tag
+fn extract_html_inner_text(text: &str, tag: &str) -> (String, String) {
+    let open_tag = format!("<{}>", tag);
+    let close_tag = format!("</{}>", tag);
+    let Some(start) = text.find(&open_tag) else {
+        return (String::new(), String::new());
+    };
+    let inner_start = start + open_tag.len();
+    let Some(end) = text[inner_start..].find(&close_tag) else {
+        return (String::new(), String::new());
+    };
+    let inner = text[inner_start..inner_start + end].trim().to_string();
+    // Parse "Artist - Title" from <i>Artist - Title</i>
+    if let Some(pos) = inner.find(" - ") {
+        let artist = inner[..pos].trim().to_string();
+        let title = inner[pos + 3..].trim().to_string();
+        (artist, title)
+    } else {
+        (String::new(), inner)
+    }
 }
 
 fn extract_kugou_songs_from_text(text: &str) -> Vec<SongDetail> {
@@ -3646,5 +4855,82 @@ mod tests {
             normalize_share_url("Link https://www.kugou.com/songlist/gcid_abc/?x=1").as_deref(),
             Some("https://www.kugou.com/songlist/gcid_abc/?x=1")
         );
+    }
+
+    #[test]
+    fn candidate_urls_include_final_redirect_metadata() {
+        let urls = kugou_playlist_candidate_urls(
+            "https://t1.kugou.com/2PRIzd7G2V2",
+            "https://www.kugou.com/songlist/gcid_3zsc75w8ziz07c/?share=1",
+            r#"{"listinfo":{"global_collection_id":"collection_3_1488927378_18_0"}}"#,
+        );
+        assert!(urls.iter().any(|url| url.contains("gcid_3zsc75w8ziz07c")));
+        assert!(urls
+            .iter()
+            .any(|url| url.contains("global_collection_id=collection_3_1488927378_18_0")));
+    }
+
+    #[test]
+    fn parses_html_li_songlist_format() {
+        let text = r#"<div class="r" style="min-height: 400px;">
+                 <div id="songs" class="list1">
+                     <strong>&lt;念 &gt;- 歌曲列表</strong>
+                     <ul>
+                         <li>
+                             <input type="checkbox" class="cb checkItem" checked="true"  style="margin-left: 8px;">
+                             <a title="笑天写意 - 尽力了就是圆满" hidefocus="true" href="https://www.kugou.com/mixsong/ejov0g0c.html" data="284017622B0A01117DF25019176BCCA7|243000">
+                                 <span class="num1">01</span>
+                                 <span class="text">
+                                     <i>笑天写意 - 尽力了就是圆满</i>
+                                 </span>
+                             </a>
+                         </li>
+                         <li>
+                             <input type="checkbox" class="cb checkItem" checked="true"  style="margin-left: 8px;">
+                             <a title="沧桑大涵 - 荒漠不败的花" hidefocus="true" href="https://www.kugou.com/mixsong/eof6wg94.html" data="21753BAF95A576D4D5CB1099A9AD6095|209000">
+                                 <span class="num1">02</span>
+                                 <span class="text">
+                                     <i>沧桑大涵 - 荒漠不败的花</i>
+                                 </span>
+                             </a>
+                         </li>
+                     </ul>
+                 </div>
+        </div>"#;
+        let songs = extract_songs_from_html_lists(text);
+        assert_eq!(songs.len(), 2);
+        assert_eq!(songs[0].title, "尽力了就是圆满");
+        assert_eq!(songs[0].artist, "笑天写意");
+        assert_eq!(songs[0].duration, Some(243.0));
+        assert_eq!(songs[0].id, "284017622B0A01117DF25019176BCCA7");
+        assert_eq!(songs[1].title, "荒漠不败的花");
+        assert_eq!(songs[1].artist, "沧桑大涵");
+        assert_eq!(songs[1].id, "21753BAF95A576D4D5CB1099A9AD6095");
+    }
+
+    #[test]
+    fn parses_get_other_list_file_json() {
+        let text = r#"{"error_code":0,"errmsg":"","data":{"info":[{"hash":"95014B8A1544E30110B1663549BAD271","audio_id":56390512,"name":"Sasha Alex Sloan - Dancing With Your Ghost","timelen":197773,"albuminfo":{"name":"Dancing With Your Ghost"},"singerinfo":[{"name":"Sasha Alex Sloan"}],"cover":"http://imge.kugou.com/stdmusic/{size}/20190626/20190626210118627550.jpg"}],"count":278}}"#;
+        let songs = extract_kugou_songs_from_text(text);
+        assert_eq!(songs.len(), 1);
+        assert_eq!(songs[0].title, "Dancing With Your Ghost");
+        assert_eq!(songs[0].artist, "Sasha Alex Sloan");
+        assert_eq!(songs[0].duration, Some(197.773));
+    }
+
+    #[test]
+    fn try_parse_pasted_json_text() {
+        let text = r#"{"error_code":0,"data":{"info":[{"hash":"HASH001","audio_id":123,"name":"Test Song","timelen":180000,"albuminfo":{"name":"Test Album"},"singerinfo":[{"name":"Test Artist"}],"cover":"http://img.test/cover.jpg"}]}}"#;
+        let result = try_parse_pasted_text(text);
+        assert!(result.is_some());
+        let playlist = result.unwrap();
+        assert!(playlist.songs.len() > 0);
+        assert_eq!(playlist.songs[0].title, "Test Song");
+        assert_eq!(playlist.songs[0].artist, "Test Artist");
+    }
+
+    #[test]
+    fn rejects_urls_in_pasted_text() {
+        assert!(try_parse_pasted_text("https://www.kugou.com/songlist/gcid_abc").is_none());
     }
 }

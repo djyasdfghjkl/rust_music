@@ -52,6 +52,7 @@ pub struct HotItem {
 pub struct RankingCategory {
     pub id: String,
     pub name: String,
+    pub cover: Option<String>,
     pub source_id: usize,
     pub source_name: String,
 }

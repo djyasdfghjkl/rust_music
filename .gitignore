@@ -5,7 +5,10 @@
 /target-package/
 /ui/dist/
 /target-win-build/
+/target-trunk-check/
 /download/
+/ui/dist-check/
+/ui/dist-check-2/
 # Packaged apps and installers
 /win/
 /mac/

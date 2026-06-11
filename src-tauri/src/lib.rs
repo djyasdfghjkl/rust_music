@@ -55,6 +55,18 @@ struct FavoritePlaylist {
     external_url: Option<String>,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct ThemeBackground {
+    id: &'static str,
+    path: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct ThemeIcon {
+    theme_id: String,
+    path: String,
+}
+
 static GLOBAL_ENGINE: OnceLock<Arc<SourceEngine>> = OnceLock::new();
 static GLOBAL_APP_DATA_DIR: OnceLock<PathBuf> = OnceLock::new();
 static GLOBAL_APP_CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -156,7 +168,7 @@ async fn get_rankings(source_id: usize) -> Vec<RankingCategory> {
 #[tauri::command]
 async fn get_all_rankings(limit: Option<usize>) -> Vec<RankingCategory> {
     let engine = get_engine();
-    engine.get_all_rankings(limit.unwrap_or(24)).await
+    engine.get_all_rankings(limit.unwrap_or(80)).await
 }
 
 #[tauri::command]
@@ -179,7 +191,7 @@ async fn get_playlists(source_id: usize) -> Vec<PlaylistInfo> {
 #[tauri::command]
 async fn get_all_playlists(limit: Option<usize>) -> Vec<PlaylistInfo> {
     let engine = get_engine();
-    engine.get_all_playlists(limit.unwrap_or(30)).await
+    engine.get_all_playlists(limit.unwrap_or(200)).await
 }
 
 #[tauri::command]
@@ -714,6 +726,118 @@ fn reveal_in_folder(path: String) -> Result<(), String> {
 }
 
 #[tauri::command]
+async fn pick_theme_image(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    let result = app
+        .dialog()
+        .file()
+        .add_filter("Image", &["png", "jpg", "jpeg", "webp", "gif", "bmp", "svg", "avif"])
+        .blocking_pick_file()
+        .map(|p| p.to_string());
+    Ok(result)
+}
+
+#[tauri::command]
+fn read_theme_image_data_url(path: String) -> Result<String, String> {
+    use base64::Engine;
+
+    let path = PathBuf::from(path.trim());
+    if !path.exists() {
+        return Err("图片文件不存在".to_string());
+    }
+
+    let bytes = std::fs::read(&path).map_err(|err| format!("读取图片失败: {err}"))?;
+    if bytes.len() > 8 * 1024 * 1024 {
+        return Err("图片过大，请选择 8MB 以内的图片".to_string());
+    }
+
+    let mime = match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "avif" => "image/avif",
+        _ => "application/octet-stream",
+    };
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+    Ok(format!("data:{mime};base64,{encoded}"))
+}
+
+#[tauri::command]
+fn get_theme_backgrounds() -> Vec<ThemeBackground> {
+    let dir = resolve_bgimg_dir();
+    [
+        ("miku", "MIKUNT.jpg"),
+        ("kuromi", "kuluomi.webp"),
+        ("bamboo", "zhu.webp"),
+        ("newyear", "newyear.webp"),
+    ]
+    .into_iter()
+    .filter_map(|(id, file)| {
+        let path = dir.join(file);
+        path.exists().then(|| ThemeBackground {
+            id,
+            path: path.to_string_lossy().to_string(),
+        })
+    })
+    .collect()
+}
+
+#[tauri::command]
+fn get_theme_icons() -> Vec<ThemeIcon> {
+    let dir = resolve_bgimg_dir();
+    let folders = [
+        ("miku", "chuyin"),
+        ("kuromi", "kuluomi"),
+        ("bamboo", "zhu"),
+        ("newyear", "newyear"),
+    ];
+    let mut icons = Vec::new();
+    for (theme_id, folder) in folders {
+        let folder_path = dir.join(folder);
+        let Ok(entries) = std::fs::read_dir(folder_path) else {
+            continue;
+        };
+        let mut paths = entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
+                    return false;
+                };
+                let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
+                    return false;
+                };
+                name.to_ascii_lowercase().starts_with("icon")
+                    && matches!(
+                        ext.to_ascii_lowercase().as_str(),
+                        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "svg" | "avif"
+                    )
+            })
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|path| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .and_then(|name| name.trim_start_matches("icon").parse::<usize>().ok())
+                .unwrap_or(usize::MAX)
+        });
+        icons.extend(paths.into_iter().map(|path| ThemeIcon {
+            theme_id: theme_id.to_string(),
+            path: path.to_string_lossy().to_string(),
+        }));
+    }
+    icons
+}
+
+#[tauri::command]
 fn list_windows_drives() -> Vec<String> {
     #[cfg(not(target_os = "windows"))]
     {
@@ -985,6 +1109,7 @@ pub fn run() {
     println!("Before tauri::Builder::run()...");
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
             let source_dir = resolve_source_dir();
@@ -1047,6 +1172,10 @@ pub fn run() {
             get_favorites_path,
             pick_download_dir,
             reveal_in_folder,
+            pick_theme_image,
+            read_theme_image_data_url,
+            get_theme_backgrounds,
+            get_theme_icons,
             list_windows_drives,
             download_song,
             download_song_by_id,
@@ -1112,4 +1241,36 @@ fn resolve_source_dir() -> std::path::PathBuf {
     }
 
     std::env::current_dir().unwrap_or_default()
+}
+
+fn resolve_bgimg_dir() -> std::path::PathBuf {
+    let mut candidates = Vec::new();
+
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            candidates.push(exe_dir.join("bgimg"));
+            candidates.push(exe_dir.join("resources").join("bgimg"));
+            candidates.push(exe_dir.join("_up_").join("resources").join("bgimg"));
+            candidates.push(exe_dir.join("..").join("bgimg"));
+        }
+    }
+
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("bgimg"));
+        candidates.push(cwd.join("resources").join("bgimg"));
+        candidates.push(cwd.join("..").join("bgimg"));
+    }
+
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    if let Some(parent) = manifest_dir.parent() {
+        candidates.push(parent.join("bgimg"));
+    }
+
+    for path in candidates {
+        if path.exists() {
+            return path;
+        }
+    }
+
+    std::env::current_dir().unwrap_or_default().join("bgimg")
 }

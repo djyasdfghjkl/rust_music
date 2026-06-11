@@ -1,8 +1,9 @@
 use crate::player::*;
-use crate::tauri_utils::{invoke, listen};
+use crate::tauri_utils::{convert_file_src, invoke, listen};
 use crate::types::*;
 use gloo_timers::future::TimeoutFuture;
 use leptos::prelude::*;
+use serde::{Deserialize, Serialize};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -42,6 +43,13 @@ enum SearchSortMode {
     Match,
     Duration,
     Title,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchFieldMode {
+    Artist,
+    Title,
+    Lyrics,
 }
 
 fn quality_rank(song: &SongResult) -> i32 {
@@ -94,6 +102,477 @@ impl SearchSortMode {
 }
 
 const LEGACY_FAVORITES_KEY: &str = "miku_tunes_favorites_v1";
+
+impl SearchFieldMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Artist => "歌手名",
+            Self::Title => "歌名",
+            Self::Lyrics => "歌词",
+        }
+    }
+}
+
+const FAVORITES_KEY: &str = "miku_tunes_favorites_v1";
+const THEME_KEY: &str = "miku_tunes_theme_v2";
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum ThemeMode {
+    System,
+    Custom,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum SystemThemeId {
+    Default,
+    Miku,
+    Kuromi,
+    Bamboo,
+    NewYear,
+    Aurora,
+    Sakura,
+    CyberNight,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct CustomTheme {
+    text_color: String,
+    secondary_text_color: String,
+    background_color: String,
+    panel_color: String,
+    scrollbar_color: String,
+    font_size: f64,
+    button_radius: f64,
+    theme_color: String,
+    button_color: String,
+    button_text_color: String,
+    background_image: Option<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct ThemeSettings {
+    mode: ThemeMode,
+    system_theme: SystemThemeId,
+    background_opacity: f64,
+    custom: CustomTheme,
+}
+
+#[derive(Clone, Deserialize)]
+struct ThemeBackground {
+    id: String,
+    path: String,
+}
+
+#[derive(Clone, Deserialize)]
+struct ThemeIcon {
+    theme_id: String,
+    path: String,
+}
+
+#[derive(Clone, Copy)]
+struct SystemThemePreset {
+    id: SystemThemeId,
+    value: &'static str,
+    label: &'static str,
+    note: &'static str,
+    accent: &'static str,
+    accent_deep: &'static str,
+    accent_light: &'static str,
+    pink: &'static str,
+    blue: &'static str,
+    bg_primary: &'static str,
+    bg_secondary: &'static str,
+    bg_soft: &'static str,
+    text_primary: &'static str,
+    text_secondary: &'static str,
+    glass_bg: &'static str,
+    background_key: Option<&'static str>,
+}
+
+impl Default for CustomTheme {
+    fn default() -> Self {
+        Self {
+            text_color: "#FFFFFF".to_string(),
+            secondary_text_color: "#B8B8D6".to_string(),
+            background_color: "#1A1A2E".to_string(),
+            panel_color: "#252542".to_string(),
+            scrollbar_color: "#39C5BB".to_string(),
+            font_size: 16.0,
+            button_radius: 8.0,
+            theme_color: "#39C5BB".to_string(),
+            button_color: "#2F2F4E".to_string(),
+            button_text_color: "#FFFFFF".to_string(),
+            background_image: None,
+        }
+    }
+}
+
+impl Default for ThemeSettings {
+    fn default() -> Self {
+        Self {
+            mode: ThemeMode::System,
+            system_theme: SystemThemeId::Default,
+            background_opacity: 0.1,
+            custom: CustomTheme::default(),
+        }
+    }
+}
+
+fn system_theme_presets() -> [SystemThemePreset; 8] {
+    [
+        SystemThemePreset {
+            id: SystemThemeId::Default,
+            value: "default",
+            label: "默认主题",
+            note: "当前 Miku Tunes 原始风格",
+            accent: "#39C5BB",
+            accent_deep: "#2A9D95",
+            accent_light: "#8EDBD5",
+            pink: "#FF9EC5",
+            blue: "#6C8BFF",
+            bg_primary: "#1A1A2E",
+            bg_secondary: "#252542",
+            bg_soft: "#2F2F4E",
+            text_primary: "#FFFFFF",
+            text_secondary: "#B8B8D6",
+            glass_bg: "rgba(37, 37, 66, 0.75)",
+            background_key: None,
+        },
+        SystemThemePreset {
+            id: SystemThemeId::Miku,
+            value: "miku",
+            label: "初音未来主题",
+            note: "青绿、黑灰、电子蓝与少量粉色",
+            accent: "#39C5BB",
+            accent_deep: "#168E91",
+            accent_light: "#9AF4EA",
+            pink: "#FF8BC7",
+            blue: "#4FA8FF",
+            bg_primary: "#071B22",
+            bg_secondary: "#102D35",
+            bg_soft: "#17424B",
+            text_primary: "#EFFFFD",
+            text_secondary: "#A9D8D4",
+            glass_bg: "rgba(10, 35, 43, 0.78)",
+            background_key: Some("miku"),
+        },
+        SystemThemePreset {
+            id: SystemThemeId::Kuromi,
+            value: "kuromi",
+            label: "库洛米风格",
+            note: "黑紫、玫粉、高反差甜酷感",
+            accent: "#D577FF",
+            accent_deep: "#8F41C8",
+            accent_light: "#F0B8FF",
+            pink: "#FF7AB8",
+            blue: "#8C80FF",
+            bg_primary: "#17101F",
+            bg_secondary: "#261833",
+            bg_soft: "#352047",
+            text_primary: "#FFF4FF",
+            text_secondary: "#D9BFE7",
+            glass_bg: "rgba(38, 24, 51, 0.78)",
+            background_key: Some("kuromi"),
+        },
+        SystemThemePreset {
+            id: SystemThemeId::Bamboo,
+            value: "bamboo",
+            label: "翠竹风格",
+            note: "翠绿、浅墨、清爽自然",
+            accent: "#4FBC72",
+            accent_deep: "#237A49",
+            accent_light: "#A9E7BC",
+            pink: "#F2C16B",
+            blue: "#79C6A5",
+            bg_primary: "#0D2219",
+            bg_secondary: "#173525",
+            bg_soft: "#214832",
+            text_primary: "#F3FFF7",
+            text_secondary: "#B9D8C4",
+            glass_bg: "rgba(18, 48, 32, 0.78)",
+            background_key: Some("bamboo"),
+        },
+        SystemThemePreset {
+            id: SystemThemeId::NewYear,
+            value: "newyear",
+            label: "新年主题",
+            note: "红色为主，搭配金色点缀",
+            accent: "#E64040",
+            accent_deep: "#9F1F2C",
+            accent_light: "#FFB3A5",
+            pink: "#FFD166",
+            blue: "#F58B57",
+            bg_primary: "#2A0910",
+            bg_secondary: "#431018",
+            bg_soft: "#5B1822",
+            text_primary: "#FFF8EE",
+            text_secondary: "#F3C3B4",
+            glass_bg: "rgba(67, 16, 24, 0.80)",
+            background_key: Some("newyear"),
+        },
+        SystemThemePreset {
+            id: SystemThemeId::Aurora,
+            value: "aurora",
+            label: "极光星河",
+            note: "蓝绿极光与深夜紫，适合沉浸播放",
+            accent: "#6FFFE9",
+            accent_deep: "#2A8FBA",
+            accent_light: "#B5FFF5",
+            pink: "#D6A2FF",
+            blue: "#5B7CFA",
+            bg_primary: "#081326",
+            bg_secondary: "#101F3A",
+            bg_soft: "#172B4E",
+            text_primary: "#F2FBFF",
+            text_secondary: "#AFC8E8",
+            glass_bg: "rgba(16, 31, 58, 0.78)",
+            background_key: None,
+        },
+        SystemThemePreset {
+            id: SystemThemeId::Sakura,
+            value: "sakura",
+            label: "樱花和风",
+            note: "樱粉、胭脂与柔和深棕",
+            accent: "#FF9BB8",
+            accent_deep: "#C95777",
+            accent_light: "#FFD3DF",
+            pink: "#F6C453",
+            blue: "#BBA7FF",
+            bg_primary: "#28151D",
+            bg_secondary: "#3A202A",
+            bg_soft: "#4A2B37",
+            text_primary: "#FFF7FA",
+            text_secondary: "#E8C0CC",
+            glass_bg: "rgba(58, 32, 42, 0.78)",
+            background_key: None,
+        },
+        SystemThemePreset {
+            id: SystemThemeId::CyberNight,
+            value: "cyber",
+            label: "赛博夜行",
+            note: "霓虹青、荧光黄与夜色界面",
+            accent: "#00E5FF",
+            accent_deep: "#0086A8",
+            accent_light: "#A7F7FF",
+            pink: "#F8FF4A",
+            blue: "#9D6BFF",
+            bg_primary: "#070A12",
+            bg_secondary: "#111827",
+            bg_soft: "#1A2333",
+            text_primary: "#F6FBFF",
+            text_secondary: "#A8B5C8",
+            glass_bg: "rgba(12, 18, 30, 0.82)",
+            background_key: None,
+        },
+    ]
+}
+
+fn preset_by_id(id: SystemThemeId) -> SystemThemePreset {
+    system_theme_presets()
+        .into_iter()
+        .find(|preset| preset.id == id)
+        .unwrap_or_else(|| system_theme_presets()[0])
+}
+
+fn system_theme_from_value(value: &str) -> SystemThemeId {
+    system_theme_presets()
+        .into_iter()
+        .find(|preset| preset.value == value)
+        .map(|preset| preset.id)
+        .unwrap_or(SystemThemeId::Default)
+}
+
+fn theme_mode_from_value(value: &str) -> ThemeMode {
+    match value {
+        "custom" => ThemeMode::Custom,
+        _ => ThemeMode::System,
+    }
+}
+
+fn theme_mode_value(mode: ThemeMode) -> &'static str {
+    match mode {
+        ThemeMode::System => "system",
+        ThemeMode::Custom => "custom",
+    }
+}
+
+fn system_theme_background_url(key: &str) -> Option<&'static str> {
+    match key {
+        "miku" => Some("./public/bgimg/MIKUNT.jpg"),
+        "kuromi" => Some("./public/bgimg/kuluomi.webp"),
+        "bamboo" => Some("./public/bgimg/zhu.webp"),
+        "newyear" => Some("./public/bgimg/newyear.webp"),
+        _ => None,
+    }
+}
+
+fn clamp_opacity(value: f64) -> f64 {
+    value.clamp(0.0, 1.0)
+}
+
+fn range_fill_style(value: f64, min: f64, max: f64) -> String {
+    let percent = if max <= min {
+        0.0
+    } else {
+        ((value - min) / (max - min) * 100.0).clamp(0.0, 100.0)
+    };
+    format!(
+        "background: linear-gradient(90deg, var(--miku-green) {percent:.2}%, rgba(255,255,255,0.28) {percent:.2}%);"
+    )
+}
+
+fn css_background_url(value: &str) -> String {
+    if value.starts_with("data:") {
+        value.to_string()
+    } else {
+        convert_file_src(value, Some("asset"))
+    }
+}
+
+fn css_url(value: &str) -> String {
+    value.replace('\\', "/").replace('"', "%22")
+}
+
+fn background_image_style(value: Option<String>) -> String {
+    value
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| format!("background-image: url(\"{}\");", css_url(&url)))
+        .unwrap_or_default()
+}
+
+fn theme_icon_key(settings: &ThemeSettings) -> &'static str {
+    match settings.system_theme {
+        SystemThemeId::Kuromi => "kuromi",
+        SystemThemeId::Bamboo => "bamboo",
+        SystemThemeId::NewYear => "newyear",
+        _ => "miku",
+    }
+}
+
+fn apply_theme_icon_vars(settings: &ThemeSettings, icons: Vec<ThemeIcon>) {
+    let key = theme_icon_key(settings);
+    let mut urls = icons
+        .iter()
+        .filter(|icon| icon.theme_id == key)
+        .map(|icon| css_background_url(&icon.path))
+        .collect::<Vec<_>>();
+    if urls.is_empty() {
+        urls = icons
+        .into_iter()
+        .map(|icon| css_background_url(&icon.path))
+        .collect::<Vec<_>>();
+    }
+
+    if urls.len() > 1 {
+        let offset = (js_sys::Math::random() * urls.len() as f64).floor() as usize;
+        urls.rotate_left(offset);
+    }
+
+    for index in 0..5 {
+        let name = format!("--theme-icon-{}", index + 1);
+        if urls.is_empty() {
+            set_css_var(&name, "none");
+        } else {
+            let url = css_url(&urls[index % urls.len()]);
+            set_css_var(&name, &format!("url(\"{url}\")"));
+        }
+    }
+}
+
+fn save_theme_settings(settings: &ThemeSettings) {
+    if let Some(storage) =
+        web_sys::window().and_then(|window| window.local_storage().ok().flatten())
+    {
+        if let Ok(raw) = serde_json::to_string(settings) {
+            let _ = storage.set_item(THEME_KEY, &raw);
+        }
+    }
+}
+
+fn load_theme_settings() -> ThemeSettings {
+    let mut settings = web_sys::window()
+        .and_then(|window| window.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(THEME_KEY).ok().flatten())
+        .and_then(|raw| serde_json::from_str::<ThemeSettings>(&raw).ok())
+        .unwrap_or_default();
+    if (settings.background_opacity - 0.5).abs() < f64::EPSILON {
+        settings.background_opacity = 0.1;
+    }
+    settings
+}
+
+fn set_css_var(name: &str, value: &str) {
+    if let Some(root) = web_sys::window()
+        .and_then(|window| window.document())
+        .and_then(|document| document.document_element())
+    {
+        if let Ok(style) = js_sys::Reflect::get(root.as_ref(), &JsValue::from_str("style")) {
+            if let Ok(set_property) =
+                js_sys::Reflect::get(&style, &JsValue::from_str("setProperty"))
+                    .and_then(|value| value.dyn_into::<js_sys::Function>())
+            {
+                let _ = set_property.call2(&style, &JsValue::from_str(name), &JsValue::from_str(value));
+            }
+        }
+    }
+}
+
+fn apply_theme_settings(settings: &ThemeSettings, background_url: Option<String>) {
+    let opacity = clamp_opacity(settings.background_opacity);
+    set_css_var("--theme-bg-opacity", &format!("{opacity:.2}"));
+    set_css_var("--theme-bg-image", "none");
+
+    match settings.mode {
+        ThemeMode::System => {
+            let preset = preset_by_id(settings.system_theme);
+            set_css_var("--miku-green", preset.accent);
+            set_css_var("--miku-green-deep", preset.accent_deep);
+            set_css_var("--miku-green-light", preset.accent_light);
+            set_css_var("--miku-pink", preset.pink);
+            set_css_var("--miku-pink-bright", preset.pink);
+            set_css_var("--miku-blue", preset.blue);
+            set_css_var("--bg-primary", preset.bg_primary);
+            set_css_var("--bg-secondary", preset.bg_secondary);
+            set_css_var("--bg-soft", preset.bg_soft);
+            set_css_var("--text-primary", preset.text_primary);
+            set_css_var("--text-secondary", preset.text_secondary);
+            set_css_var("--glass-bg", preset.glass_bg);
+            set_css_var("--custom-button-bg", "var(--bg-soft)");
+            set_css_var("--custom-button-text", "var(--text-primary)");
+            set_css_var("--custom-radius", "8px");
+            set_css_var("--scrollbar-color", "var(--bg-soft)");
+            set_css_var("--app-font-size", "16px");
+            if let Some(url) = background_url {
+                set_css_var("--theme-bg-image", &format!("url(\"{url}\")"));
+            }
+        }
+        ThemeMode::Custom => {
+            let custom = &settings.custom;
+            set_css_var("--miku-green", &custom.theme_color);
+            set_css_var("--miku-green-deep", &custom.theme_color);
+            set_css_var("--miku-green-light", &custom.theme_color);
+            set_css_var("--miku-pink", &custom.button_color);
+            set_css_var("--miku-pink-bright", &custom.button_color);
+            set_css_var("--miku-blue", &custom.scrollbar_color);
+            set_css_var("--bg-primary", &custom.background_color);
+            set_css_var("--bg-secondary", &custom.panel_color);
+            set_css_var("--bg-soft", &custom.button_color);
+            set_css_var("--text-primary", &custom.text_color);
+            set_css_var("--text-secondary", &custom.secondary_text_color);
+            set_css_var("--glass-bg", &format!("{}cc", custom.panel_color));
+            set_css_var("--custom-button-bg", &custom.button_color);
+            set_css_var("--custom-button-text", &custom.button_text_color);
+            set_css_var("--custom-radius", &format!("{:.0}px", custom.button_radius));
+            set_css_var("--scrollbar-color", &custom.scrollbar_color);
+            set_css_var("--app-font-size", &format!("{:.0}px", custom.font_size));
+            if let Some(path) = custom.background_image.as_ref() {
+                let url = css_background_url(path);
+                set_css_var("--theme-bg-image", &format!("url(\"{url}\")"));
+            }
+        }
+    }
+}
+
 #[component]
 pub fn MainPage() -> impl IntoView {
     let current_page = RwSignal::new(Page::Home);
@@ -115,6 +594,10 @@ pub fn MainPage() -> impl IntoView {
     let search_attempted = RwSignal::new(false);
     let is_searching = RwSignal::new(false);
     let search_token = RwSignal::new(0_u64);
+    let search_total = RwSignal::new(0_usize);
+    let search_offset = RwSignal::new(100_usize);
+    let search_loading_more = RwSignal::new(false);
+    let search_has_more = RwSignal::new(true);
     let debounce_token = RwSignal::new(0_u64);
     let ime_composing = RwSignal::new(false);
 
@@ -133,6 +616,9 @@ pub fn MainPage() -> impl IntoView {
     let orb_top = RwSignal::new(Option::<f64>::None);
     let orb_dragging = RwSignal::new(false);
     let orb_moved = RwSignal::new(false);
+    let theme_settings = RwSignal::new(load_theme_settings());
+    let theme_backgrounds = RwSignal::new(Vec::<ThemeBackground>::new());
+    let theme_icons = RwSignal::new(Vec::<ThemeIcon>::new());
     let player_state = PlayerState::new();
     setup_audio_events(player_state.clone());
     setup_download_events(player_state.clone());
@@ -156,6 +642,75 @@ pub fn MainPage() -> impl IntoView {
             favorites.set(loaded);
         });
     }
+
+    {
+        let theme_backgrounds = theme_backgrounds.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(value) = invoke("get_theme_backgrounds", None).await {
+                if let Ok(items) = serde_wasm_bindgen::from_value::<Vec<ThemeBackground>>(value) {
+                    theme_backgrounds.set(items);
+                }
+            }
+        });
+    }
+
+    {
+        let theme_icons = theme_icons.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            if let Ok(value) = invoke("get_theme_icons", None).await {
+                if let Ok(items) = serde_wasm_bindgen::from_value::<Vec<ThemeIcon>>(value) {
+                    theme_icons.set(items);
+                }
+            }
+        });
+    }
+
+    Effect::new(move |_| {
+        let settings = theme_settings.get();
+        if settings.mode == ThemeMode::Custom {
+            if let Some(path) = settings.custom.background_image.clone() {
+                if !path.starts_with("data:") {
+                    let theme_settings = theme_settings.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let args = js_sys::Object::new();
+                        let _ = js_sys::Reflect::set(
+                            &args,
+                            &JsValue::from_str("path"),
+                            &JsValue::from_str(&path),
+                        );
+                        if let Ok(value) = invoke("read_theme_image_data_url", Some(&args)).await {
+                            if let Some(data_url) = value.as_string() {
+                                theme_settings.update(|settings| {
+                                    if settings.custom.background_image.as_deref() == Some(&path) {
+                                        settings.custom.background_image = Some(data_url);
+                                    }
+                                });
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        let background_url = if settings.mode == ThemeMode::System {
+            preset_by_id(settings.system_theme)
+                .background_key
+                .and_then(|key| {
+                    let packaged = system_theme_background_url(key).map(str::to_string);
+                    packaged.or_else(|| {
+                        theme_backgrounds
+                        .get()
+                        .into_iter()
+                        .find(|item| item.id == key)
+                        .map(|item| convert_file_src(&item.path, Some("asset")))
+                    })
+                })
+        } else {
+            None
+        };
+        apply_theme_settings(&settings, background_url);
+        apply_theme_icon_vars(&settings, theme_icons.get());
+        save_theme_settings(&settings);
+    });
 
     {
         let search_results = search_results.clone();
@@ -295,6 +850,10 @@ pub fn MainPage() -> impl IntoView {
             search_attempted.set(true);
             is_searching.set(true);
             let results_signal = search_results.clone();
+            let total_signal = search_total.clone();
+            let offset_signal = search_offset.clone();
+            let loading_more_signal = search_loading_more.clone();
+            let has_more_signal = search_has_more.clone();
             let attempted_signal = search_attempted.clone();
             let searching_signal = is_searching.clone();
             let token_signal = search_token.clone();
@@ -311,13 +870,19 @@ pub fn MainPage() -> impl IntoView {
                     &JsValue::from_f64(token as f64),
                 );
                 let mut results = Vec::new();
+                let mut total = 0;
                 if let Ok(value) = invoke("search_music_stream", Some(&args)).await {
                     if let Ok(resp) = serde_wasm_bindgen::from_value::<SearchResponse>(value) {
+                        total = resp.total;
                         results = resp.results;
                     }
                 }
                 if token_signal.get_untracked() == token {
                     results_signal.set(dedupe_search_results(results));
+                    total_signal.set(total);
+                    offset_signal.set(100);
+                    loading_more_signal.set(false);
+                    has_more_signal.set(true);
                     attempted_signal.set(true);
                     searching_signal.set(false);
                 }
@@ -711,11 +1276,72 @@ pub fn MainPage() -> impl IntoView {
         })
     };
 
-    let right_panel_search = navigate_search.clone();
+    let _right_panel_search = navigate_search.clone();
     let player_bar_toggle_favorite = toggle_favorite_song.clone();
     let full_player_toggle_favorite = toggle_favorite_song.clone();
     let content_do_search = navigate_search.clone();
     let content_schedule_search = schedule_search.clone();
+    let content_load_more = {
+        let search_query = search_query.clone();
+        let search_results = search_results.clone();
+        let search_total = search_total.clone();
+        let search_offset = search_offset.clone();
+        let search_loading_more = search_loading_more.clone();
+        let search_has_more = search_has_more.clone();
+        let search_token = search_token.clone();
+        std::sync::Arc::new(move || {
+            let keyword = search_query.get_untracked();
+            if keyword.is_empty() {
+                return;
+            }
+            if !search_has_more.get_untracked() || search_loading_more.get_untracked() {
+                return;
+            }
+            let offset = search_offset.get_untracked();
+            search_loading_more.set(true);
+            let results_signal = search_results.clone();
+            let offset_signal = search_offset.clone();
+            let has_more_signal = search_has_more.clone();
+            let loading_more = search_loading_more.clone();
+            let token_signal = search_token.clone();
+            let token = token_signal.get_untracked();
+            wasm_bindgen_futures::spawn_local(async move {
+                let args = js_sys::Object::new();
+                let _ = js_sys::Reflect::set(
+                    &args,
+                    &JsValue::from_str("keyword"),
+                    &JsValue::from_str(&keyword),
+                );
+                let _ = js_sys::Reflect::set(
+                    &args,
+                    &JsValue::from_str("offset"),
+                    &JsValue::from_f64(offset as f64),
+                );
+                if let Ok(value) = invoke("search_music_more", Some(&args)).await {
+                    if let Ok(resp) = serde_wasm_bindgen::from_value::<SearchResponse>(value) {
+                        if token_signal.get_untracked() == token {
+                            if resp.results.is_empty() {
+                                has_more_signal.set(false);
+                                loading_more.set(false);
+                                return;
+                            }
+                            let mut existing = results_signal.get_untracked();
+                            let existing_keys: std::collections::HashSet<String> =
+                                existing.iter().map(search_result_key).collect();
+                            for item in resp.results {
+                                if !existing_keys.contains(&search_result_key(&item)) {
+                                    existing.push(item);
+                                }
+                            }
+                            results_signal.set(existing);
+                            offset_signal.set(offset + 100);
+                            loading_more.set(false);
+                        }
+                    }
+                }
+            });
+        })
+    };
     let content_play_song = on_play_song.clone();
     let content_play_song_list = on_play_song_list.clone();
     let content_play_search = on_play_search_result.clone();
@@ -739,6 +1365,7 @@ pub fn MainPage() -> impl IntoView {
                 on_select_playlist=on_select_playlist.clone()
             />
             <main class="main-content">
+                <div class="theme-background-layer"></div>
                 {move || match current_page.get() {
                     Page::Home => view! {
                         <HomeView
@@ -805,9 +1432,13 @@ pub fn MainPage() -> impl IntoView {
                             search_results
                             search_attempted
                             is_searching
+                            search_loading_more
+                            search_total
+                            search_has_more
                             ime_composing
                             schedule_search=content_schedule_search.clone()
                             do_search=content_do_search.clone()
+                            load_more=content_load_more.clone()
                             favorites=favorites.get()
                             on_play_search_result=content_play_search.clone()
                             on_append_search_results=content_append_search.clone()
@@ -848,18 +1479,19 @@ pub fn MainPage() -> impl IntoView {
                         <SettingsView
                             sources
                             active_source
+                            theme_settings
                             on_move_source=content_move_source.clone()
                             on_set_source_enabled=content_set_source_enabled.clone()
                         />
                     }.into_any(),
                 }}
             </main>
-            <RightPanel
-                sources
-                active_source
-                hot_keywords
-                on_search=right_panel_search
-            />
+            // <RightPanel
+            //     sources
+            //     active_source
+            //     hot_keywords
+            //     on_search=right_panel_search
+            // />
             <PlayerBar state=player_state.clone() favorites on_toggle_favorite=player_bar_toggle_favorite />
         </div>
 
@@ -1013,6 +1645,7 @@ fn Sidebar(
                         >
                             <i class=format!("nav-icon iconfont {icon_class}")></i>
                             <span class="nav-label">{label}</span>
+                            <span class="theme-nav-deco"></span>
                         </a>
                     }
                 }).collect_view()}
@@ -1117,6 +1750,49 @@ fn HomeView(
                     </Show>
                 </div>
             </div>
+            <section class="home-shelf home-playlists">
+                <div class="home-shelf-header">
+                    <button class="section-more-btn" on:click=move |_| on_more_playlists()><i class="iconfont icon-jia"></i><span>"查看更多"</span></button>
+                    <h2>"歌单"</h2>
+                    <span>{let count = playlists.len(); format!("{count} 个歌单")}</span>
+                </div>
+                <div class="home-playlist-grid">
+                    {if playlists.is_empty() {
+                        view! { <div class="home-empty">"暂无歌单数据"</div> }.into_any()
+                    } else {
+                        playlists.into_iter().take(3).enumerate().map(|(index, playlist)| {
+                            let on_select = on_select_playlist.clone();
+                            let toggle = on_toggle_favorite_playlist.clone();
+                            let fav = favorite_from_playlist(&playlist, None);
+                            let fav_for_click = fav.clone();
+                            let is_fav = favorites.playlists.iter().any(|item| item.id == fav.id && item.source_name == fav.source_name);
+                            let item = playlist.clone();
+                            let cover_url = playlist.cover.clone().unwrap_or_default();
+                            let has_cover = !cover_url.trim().is_empty();
+                            let icon_slot = format!("theme-icon-slot-{}", index % 5 + 1);
+                            view! {
+                                <button class="home-playlist-card" on:click=move |_| on_select(item.clone())>
+                                    <span class="favorite-chip card" class:active=is_fav on:click=move |ev| {
+                                        ev.stop_propagation();
+                                        toggle(fav_for_click.clone());
+                                    }>"♥"</span>
+                                    <span class="home-playlist-cover">
+                                        <Show
+                                            when=move || has_cover
+                                            fallback=move || view! { <span>"♫"</span> }
+                                        >
+                                            <img src=cover_url.clone() alt="playlist" />
+                                        </Show>
+                                    </span>
+                                    <span class="home-playlist-name">{playlist.name}</span>
+                                    <span class=format!("theme-card-deco {icon_slot}")></span>
+                                    <span class="home-playlist-meta">{playlist.song_count.map(|count| format!("{count} 首")).unwrap_or_else(|| "歌单".to_string())}" · "{playlist.source_name}</span>
+                                </button>
+                            }.into_any()
+                        }).collect::<Vec<_>>().into_any()
+                    }}
+                </div>
+            </section>
             <div class="home-shelf-grid">
                 <section class="home-shelf">
                     <div class="home-shelf-header">
@@ -1136,13 +1812,21 @@ fn HomeView(
                             rankings.into_iter().take(6).enumerate().map(|(index, ranking)| {
                                 let on_select = on_select_ranking.clone();
                                 let item = ranking.clone();
+                                let cover_style = background_image_style(ranking.cover.clone());
+                                let card_class = if ranking.cover.as_ref().is_some_and(|cover| !cover.trim().is_empty()) {
+                                    "home-rank-item has-ranking-cover"
+                                } else {
+                                    "home-rank-item"
+                                };
+                                let icon_slot = format!("theme-icon-slot-{}", index % 5 + 1);
                                 view! {
-                                    <button class="home-rank-item" on:click=move |_| on_select(item.clone())>
+                                    <button class=card_class style=cover_style on:click=move |_| on_select(item.clone())>
                                         <span class="home-rank-no">{index + 1}</span>
                                         <span class="home-item-main">
                                             <strong>{ranking.name}</strong>
                                             <small>{ranking.source_name}</small>
                                         </span>
+                                        <span class=format!("theme-card-deco {icon_slot}")></span>
                                     </button>
                                 }.into_any()
                             }).collect::<Vec<_>>().into_any()
@@ -1159,9 +1843,10 @@ fn HomeView(
                         {if hot_keywords.is_empty() {
                             view! { <div class="home-empty">"暂无热门搜索"</div> }.into_any()
                         } else {
-                            hot_keywords.into_iter().take(6).map(|item| {
+                            hot_keywords.into_iter().take(6).enumerate().map(|(index, item)| {
                                 let keyword = item.title.clone();
                                 let on_search = on_search.clone();
+                                let icon_slot = format!("theme-icon-slot-{}", index % 5 + 1);
                                 view! {
                                     <button class="home-song-item" on:click=move |_| on_search(keyword.clone())>
                                         <span class="home-song-cover hot">"热"</span>
@@ -1169,6 +1854,7 @@ fn HomeView(
                                             <strong>{item.title}</strong>
                                             <small>{item.source}</small>
                                         </span>
+                                        <span class=format!("theme-card-deco {icon_slot}")></span>
                                     </button>
                                 }.into_any()
                             }).collect::<Vec<_>>().into_any()
@@ -1176,47 +1862,6 @@ fn HomeView(
                     </div>
                 </section>
             </div>
-            <section class="home-shelf home-playlists">
-                <div class="home-shelf-header">
-                    <button class="section-more-btn" on:click=move |_| on_more_playlists()><i class="iconfont icon-jia"></i><span>"查看更多"</span></button>
-                    <h2>"歌单"</h2>
-                    <span>"精选歌单"</span>
-                </div>
-                <div class="home-playlist-grid">
-                    {if playlists.is_empty() {
-                        view! { <div class="home-empty">"暂无歌单数据"</div> }.into_any()
-                    } else {
-                        playlists.into_iter().take(10).map(|playlist| {
-                            let on_select = on_select_playlist.clone();
-                            let toggle = on_toggle_favorite_playlist.clone();
-                            let fav = favorite_from_playlist(&playlist, None);
-                            let fav_for_click = fav.clone();
-                            let is_fav = favorites.playlists.iter().any(|item| item.id == fav.id && item.source_name == fav.source_name);
-                            let item = playlist.clone();
-                            let cover_url = playlist.cover.clone().unwrap_or_default();
-                            let has_cover = !cover_url.trim().is_empty();
-                            view! {
-                                <button class="home-playlist-card" on:click=move |_| on_select(item.clone())>
-                                    <span class="favorite-chip card" class:active=is_fav on:click=move |ev| {
-                                        ev.stop_propagation();
-                                        toggle(fav_for_click.clone());
-                                    }>"♥"</span>
-                                    <span class="home-playlist-cover">
-                                        <Show
-                                            when=move || has_cover
-                                            fallback=move || view! { <span>"♫"</span> }
-                                        >
-                                            <img src=cover_url.clone() alt="playlist" />
-                                        </Show>
-                                    </span>
-                                    <span class="home-playlist-name">{playlist.name}</span>
-                                    <span class="home-playlist-meta">{playlist.song_count.map(|count| format!("{count} 首")).unwrap_or_else(|| "歌单".to_string())}" · "{playlist.source_name}</span>
-                                </button>
-                            }.into_any()
-                        }).collect::<Vec<_>>().into_any()
-                    }}
-                </div>
-            </section>
         </section>
     }
 }
@@ -1317,14 +1962,22 @@ fn RankingView(
                     ).into_any()
                 } else {
                     view! { <div class="ranking-grid">
-                        {rankings.get().into_iter().map(|ranking| {
+                        {rankings.get().into_iter().enumerate().map(|(index, ranking)| {
                         let on_select = on_select_ranking.clone();
                         let item = ranking.clone();
+                        let cover_style = background_image_style(ranking.cover.clone());
+                        let card_class = if ranking.cover.as_ref().is_some_and(|cover| !cover.trim().is_empty()) {
+                            "ranking-card has-ranking-cover"
+                        } else {
+                            "ranking-card"
+                        };
+                        let icon_slot = format!("theme-icon-slot-{}", index % 5 + 1);
                         view! {
-                            <button class="ranking-card" on:click=move |_| on_select(item.clone())>
+                            <button class=card_class style=cover_style on:click=move |_| on_select(item.clone())>
                                 <i class="ranking-card-icon iconfont icon-paihangbang"></i>
                                 <div class="ranking-card-name">{ranking.name}</div>
                                 <div class="ranking-card-source">{ranking.source_name}</div>
+                                <span class=format!("theme-card-deco {icon_slot}")></span>
                             </button>
                         }
                     }).collect_view()}
@@ -1373,7 +2026,7 @@ fn PlaylistView(
                     ).into_any()
                 } else {
                     view! { <div class="playlist-grid">
-                        {playlists.get().into_iter().map(|playlist| {
+                        {playlists.get().into_iter().enumerate().map(|(index, playlist)| {
                         let on_select = on_select_playlist.clone();
                         let toggle = on_toggle_favorite_playlist.clone();
                         let fav = favorite_from_playlist(&playlist, None);
@@ -1382,6 +2035,7 @@ fn PlaylistView(
                         let item = playlist.clone();
                         let cover_url = playlist.cover.clone().unwrap_or_default();
                         let has_cover = !cover_url.trim().is_empty();
+                        let icon_slot = format!("theme-icon-slot-{}", index % 5 + 1);
                         view! {
                             <div class="playlist-card" on:click=move |_| on_select(item.clone())>
                                 <button class="favorite-chip" class:active=is_fav on:click=move |ev| {
@@ -1397,6 +2051,7 @@ fn PlaylistView(
                                     </Show>
                                 </div>
                                 <div class="playlist-card-name">{playlist.name}</div>
+                                <span class=format!("theme-card-deco {icon_slot}")></span>
                                 <div class="playlist-card-meta">
                                     <span>{playlist.source_name}</span>
                                     <span>{playlist.song_count.map(|count| format!("{count} 首")).unwrap_or_default()}</span>
@@ -1417,9 +2072,13 @@ fn SearchView(
     search_results: RwSignal<Vec<SongResult>>,
     search_attempted: RwSignal<bool>,
     is_searching: RwSignal<bool>,
+    search_loading_more: RwSignal<bool>,
+    search_total: RwSignal<usize>,
+    search_has_more: RwSignal<bool>,
     ime_composing: RwSignal<bool>,
     schedule_search: std::sync::Arc<dyn Fn(String) + Send + Sync>,
     do_search: std::sync::Arc<dyn Fn(String) + Send + Sync>,
+    load_more: std::sync::Arc<dyn Fn() + Send + Sync>,
     favorites: FavoritesData,
     on_play_search_result: std::sync::Arc<dyn Fn(Vec<SongResult>, usize) + Send + Sync>,
     on_append_search_results: std::sync::Arc<dyn Fn(Vec<SongResult>) + Send + Sync>,
@@ -1428,9 +2087,80 @@ fn SearchView(
 ) -> impl IntoView {
     let sort_mode = RwSignal::new(SearchSortMode::Source);
     let sort_desc = RwSignal::new(false);
+    let field_mode = RwSignal::new(SearchFieldMode::Artist);
     let multi_select = RwSignal::new(false);
     let selected_results = RwSignal::new(std::collections::HashSet::<String>::new());
     let select_count = RwSignal::new("10".to_string());
+    // Infinite scroll: detect scroll to bottom via sentinel
+    {
+        let load_more = load_more.clone();
+        let search_attempted = search_attempted.clone();
+        let search_results = search_results.clone();
+        let search_total = search_total.clone();
+        let check_interval = std::sync::Arc::new(std::sync::Mutex::new(None::<i32>));
+        let interval_handle = check_interval.clone();
+        create_effect(move |_| {
+            let _ = (
+                search_attempted.get(),
+                search_results.get().len(),
+                search_total.get(),
+            );
+            // Clear previous interval
+            if let Some(id) = *interval_handle.lock().unwrap() {
+                if let Some(window) = web_sys::window() {
+                    let _ = window.clear_interval_with_handle(id);
+                }
+            }
+            let load_more = load_more.clone();
+            let id = web_sys::window().and_then(|w| {
+                w.set_interval_with_callback_and_timeout_and_arguments_0(
+                    Closure::wrap(Box::new(move || {
+                        if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                            if let Some(el) = doc.get_element_by_id("search-scroll-sentinel") {
+                                let js_val: &js_sys::Object = el.unchecked_ref();
+                                if let Ok(rect) = js_sys::Reflect::get(
+                                    js_val,
+                                    &JsValue::from_str("getBoundingClientRect"),
+                                ) {
+                                    if let Some(func) = rect.dyn_ref::<js_sys::Function>() {
+                                        if let Ok(dom_rect) = func.call0(&el) {
+                                            if let Some(bottom) = js_sys::Reflect::get(
+                                                &dom_rect,
+                                                &JsValue::from_str("bottom"),
+                                            )
+                                            .ok()
+                                            .and_then(|v| v.as_f64())
+                                            {
+                                                let threshold = web_sys::window()
+                                                    .map(|w| {
+                                                        w.inner_height()
+                                                            .unwrap_or(0.0.into())
+                                                            .as_f64()
+                                                            .unwrap_or(0.0)
+                                                    })
+                                                    .unwrap_or(0.0)
+                                                    + 200.0;
+                                                if bottom <= threshold && bottom > 0.0 {
+                                                    load_more();
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }) as Box<dyn FnMut()>)
+                    .into_js_value()
+                    .unchecked_ref(),
+                    500,
+                )
+                .ok()
+            });
+            *interval_handle.lock().unwrap() = id;
+        });
+        // Cleanup on drop
+        let _ = check_interval;
+    }
     let on_input = {
         let schedule_search = schedule_search.clone();
         move |ev: leptos::ev::Event| {
@@ -1455,7 +2185,7 @@ fn SearchView(
         if sort_desc.get() {
             results.reverse();
         }
-        results
+        apply_search_field_mode(results, &search_query.get(), field_mode.get())
     };
     let bulk_add_favorite_song = on_add_favorite_song.clone();
     view! {
@@ -1482,6 +2212,27 @@ fn SearchView(
                     </Show>
                 </div>
                 <div class="search-sort-strip">
+                    <For
+                        each=move || vec![
+                            SearchFieldMode::Artist,
+                            SearchFieldMode::Title,
+                            SearchFieldMode::Lyrics,
+                        ]
+                        key=|mode| *mode as u8
+                        let:mode
+                    >
+                        <button
+                            class="search-field-btn"
+                            class:active=move || field_mode.get() == mode
+                            on:click=move |_| {
+                                field_mode.set(mode);
+                                selected_results.set(std::collections::HashSet::new());
+                            }
+                        >
+                            {mode.label()}
+                        </button>
+                    </For>
+                    <span class="search-sort-divider"></span>
                     <For
                         each=move || vec![
                             SearchSortMode::Source,
@@ -1521,12 +2272,16 @@ fn SearchView(
             <div class="section-header">
                 <div class="search-selection-tools">
                     <span class="section-more">{move || {
-                        let total = search_results.get().len();
                         let selected = selected_results.get().len();
-                        if total >= 300 {
-                            format!("300+ 首 · 已选 {selected}")
+                        if multi_select.get() {
+                            format!("已选 {selected}")
                         } else {
-                            format!("{total} 首 · 已选 {selected}")
+                            let total = search_results.get().len();
+                            if total >= 300 {
+                                format!("300+ 首")
+                            } else {
+                                format!("{total} 首")
+                            }
                         }
                     }}</span>
                     <Show when=move || multi_select.get()>
@@ -1547,6 +2302,7 @@ fn SearchView(
                             if sort_desc.get() {
                                 results.reverse();
                             }
+                            let results = apply_search_field_mode(results, &search_query.get(), field_mode.get());
                             selected_results.set(
                                 results
                                     .into_iter()
@@ -1556,9 +2312,13 @@ fn SearchView(
                             );
                         }><i class="iconfont icon-add-s"></i><span>"选前N首"</span></button>
                         <button class="section-more-btn" on:click=move |_| {
+                            let mut results = sort_search_results(search_results.get(), sort_mode.get());
+                            if sort_desc.get() {
+                                results.reverse();
+                            }
+                            let results = apply_search_field_mode(results, &search_query.get(), field_mode.get());
                             selected_results.set(
-                                search_results
-                                    .get()
+                                results
                                     .into_iter()
                                     .map(|song| search_result_key(&song))
                                     .collect()
@@ -1644,6 +2404,21 @@ fn SearchView(
                     favorites.clone(),
                     on_toggle_favorite_song.clone(),
                 )}
+                {move || {
+                    if search_attempted.get() && sorted_results().len() > 0 && search_has_more.get() {
+                        view! {
+                            <div class="infinite-scroll-sentinel" id="search-scroll-sentinel">
+                                {if search_loading_more.get() {
+                                    view! { <div class="loading-spinner" style="width:24px;height:24px;border-width:2px;margin:12px auto;"></div> }.into_any()
+                                } else {
+                                    view! { <div style="height:1px;"></div> }.into_any()
+                                }}
+                            </div>
+                        }.into_any()
+                    } else {
+                        view! { <div style="height:1px;"></div> }.into_any()
+                    }
+                }}
             </div>
         </section>
     }
@@ -1746,6 +2521,96 @@ fn sort_search_results(mut results: Vec<SongResult>, mode: SearchSortMode) -> Ve
     results
 }
 
+fn clean_markup_text(value: &str) -> String {
+    let decoded = value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'");
+    let mut out = String::new();
+    let mut in_tag = false;
+    for ch in decoded.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(ch),
+            _ => {}
+        }
+    }
+    out.trim().to_string()
+}
+
+fn clean_song_result(mut song: SongResult) -> SongResult {
+    song.title = clean_markup_text(&song.title);
+    song.artist = clean_markup_text(&song.artist);
+    song
+}
+
+fn contains_query(value: &str, query: &str) -> bool {
+    let value = clean_markup_text(value).to_lowercase();
+    let query = query.trim().to_lowercase();
+    !query.is_empty() && value.contains(&query)
+}
+
+fn search_field_score(song: &SongResult, query: &str, mode: SearchFieldMode) -> i32 {
+    match mode {
+        SearchFieldMode::Artist => {
+            if contains_query(&song.artist, query) {
+                30
+            } else if contains_query(&song.title, query) {
+                5
+            } else {
+                0
+            }
+        }
+        SearchFieldMode::Title => {
+            if contains_query(&song.title, query) {
+                30
+            } else if contains_query(&song.artist, query) {
+                5
+            } else {
+                0
+            }
+        }
+        SearchFieldMode::Lyrics => 0,
+    }
+}
+
+fn apply_search_field_mode(
+    results: Vec<SongResult>,
+    query: &str,
+    mode: SearchFieldMode,
+) -> Vec<SongResult> {
+    let query = query.trim();
+    let mut cleaned = results
+        .into_iter()
+        .map(clean_song_result)
+        .collect::<Vec<_>>();
+    if query.is_empty() || mode == SearchFieldMode::Lyrics {
+        return cleaned;
+    }
+
+    cleaned.sort_by(|a, b| {
+        search_field_score(b, query, mode)
+            .cmp(&search_field_score(a, query, mode))
+            .then_with(|| b.score.cmp(&a.score))
+    });
+
+    let matched = cleaned
+        .iter()
+        .filter(|song| search_field_score(song, query, mode) >= 30)
+        .count();
+    if matched > 0 {
+        cleaned
+            .into_iter()
+            .filter(|song| search_field_score(song, query, mode) > 0)
+            .collect()
+    } else {
+        cleaned
+    }
+}
+
 fn render_search_list(
     results: Vec<SongResult>,
     attempted: bool,
@@ -1770,6 +2635,7 @@ fn render_search_list(
         .enumerate()
         .map(|(_index, song)| {
             let play = on_play.clone();
+            let song = clean_song_result(song);
             let song_for_click = song.clone();
             let selected_for_click = selected.clone();
             let key_for_click = search_result_key(&song);
@@ -2022,6 +2888,7 @@ fn render_favorites_view(
 fn SettingsView(
     sources: RwSignal<Vec<SourceInfo>>,
     active_source: RwSignal<Option<SourceInfo>>,
+    theme_settings: RwSignal<ThemeSettings>,
     on_move_source: std::sync::Arc<dyn Fn(usize, String) + Send + Sync>,
     on_set_source_enabled: std::sync::Arc<dyn Fn(usize, bool) + Send + Sync>,
 ) -> impl IntoView {
@@ -2030,6 +2897,7 @@ fn SettingsView(
     let preferred_quality = RwSignal::new("320k 优先".to_string());
     let lyric_translate = RwSignal::new(false);
     let download_status = RwSignal::new(String::new());
+    let theme_dirty = RwSignal::new(false);
     {
         let download_path = download_path.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -2092,9 +2960,140 @@ fn SettingsView(
             let _ = window.open_with_url("https://github.com/djyasdfghjkl/rust_music");
         }
     };
+    let update_custom = {
+        let theme_settings = theme_settings.clone();
+        let theme_dirty = theme_dirty.clone();
+        move |update: std::sync::Arc<dyn Fn(&mut CustomTheme)>| {
+            theme_settings.update(|settings| {
+                settings.mode = ThemeMode::Custom;
+                update(&mut settings.custom);
+            });
+            theme_dirty.set(true);
+        }
+    };
+    let pick_theme_image = {
+        let theme_settings = theme_settings.clone();
+        let theme_dirty = theme_dirty.clone();
+        move |_| {
+            let theme_settings = theme_settings.clone();
+            let theme_dirty = theme_dirty.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                if let Ok(value) = invoke("pick_theme_image", None).await {
+                    if let Some(path) = value.as_string().filter(|path| !path.trim().is_empty()) {
+                        let args = js_sys::Object::new();
+                        let _ = js_sys::Reflect::set(
+                            &args,
+                            &JsValue::from_str("path"),
+                            &JsValue::from_str(&path),
+                        );
+                        let image_value = match invoke("read_theme_image_data_url", Some(&args)).await {
+                            Ok(value) => value.as_string().unwrap_or_else(|| path.clone()),
+                            Err(_) => path.clone(),
+                        };
+                        theme_settings.update(|settings| {
+                            settings.mode = ThemeMode::Custom;
+                            settings.custom.background_image = Some(image_value);
+                        });
+                        theme_dirty.set(true);
+                    }
+                }
+            });
+        }
+    };
+    let clear_theme_image = {
+        let theme_settings = theme_settings.clone();
+        let theme_dirty = theme_dirty.clone();
+        move |_| {
+            theme_settings.update(|settings| settings.custom.background_image = None);
+            theme_dirty.set(true);
+        }
+    };
+    let reset_theme = {
+        let theme_settings = theme_settings.clone();
+        let theme_dirty = theme_dirty.clone();
+        move |_| {
+            theme_settings.set(ThemeSettings::default());
+            theme_dirty.set(false);
+        }
+    };
     view! {
         <section class="section settings-page">
+            <Show when=move || theme_dirty.get()>
+                <button class="theme-reset-float" on:click=reset_theme>
+                    "重置为默认"
+                </button>
+            </Show>
             <div class="settings-band settings-system">
+                <div class="theme-settings-panel">
+                    <div class="settings-subhead">
+                        <strong>"2.0 主题"</strong>
+                        <small>"系统预设 + 用户高度自定义"</small>
+                    </div>
+                    <div class="theme-controls-grid">
+                        <label class="setting-field">
+                            <span>"主题模式"</span>
+                            <select
+                                prop:value=move || theme_mode_value(theme_settings.get().mode).to_string()
+                                on:change=move |ev| {
+                                    theme_settings.update(|settings| {
+                                        settings.mode = theme_mode_from_value(&event_target_value(&ev));
+                                    });
+                                    theme_dirty.set(true);
+                                }
+                            >
+                                <option value="system">"系统主题"</option>
+                                <option value="custom">"自定义主题"</option>
+                            </select>
+                        </label>
+                        <label class="setting-field">
+                            <span>"系统主题"</span>
+                            <select
+                                prop:value=move || preset_by_id(theme_settings.get().system_theme).value.to_string()
+                                prop:disabled=move || theme_settings.get().mode != ThemeMode::System
+                                on:change=move |ev| {
+                                    theme_settings.update(|settings| {
+                                        settings.mode = ThemeMode::System;
+                                        settings.system_theme = system_theme_from_value(&event_target_value(&ev));
+                                    });
+                                    theme_dirty.set(true);
+                                }
+                            >
+                                {system_theme_presets().into_iter().map(|preset| view! {
+                                    <option value=preset.value>{preset.label}</option>
+                                }).collect_view()}
+                            </select>
+                        </label>
+                        <label class="setting-field">
+                            <span>"背景图透明度"</span>
+                            <input
+                                class="theme-range"
+                                type="range"
+                                min="0"
+                                max="1"
+                                step="0.05"
+                                prop:value=move || format!("{:.2}", theme_settings.get().background_opacity)
+                                style=move || range_fill_style(theme_settings.get().background_opacity, 0.0, 1.0)
+                                on:input=move |ev| {
+                                    let opacity = event_target_value(&ev).parse::<f64>().unwrap_or(0.1);
+                                    theme_settings.update(|settings| settings.background_opacity = clamp_opacity(opacity));
+                                    theme_dirty.set(true);
+                                }
+                            />
+                            <span class="setting-value">{move || format!("{:.0}%", theme_settings.get().background_opacity * 100.0)}</span>
+                        </label>
+                        <div class="theme-current-note">
+                            {move || {
+                                let settings = theme_settings.get();
+                                if settings.mode == ThemeMode::System {
+                                    let preset = preset_by_id(settings.system_theme);
+                                    format!("{}: {}", preset.label, preset.note)
+                                } else {
+                                    "自定义主题: 颜色、字号、圆角和背景会即时生效".to_string()
+                                }
+                            }}
+                        </div>
+                    </div>
+                </div>
                 <div class="settings-band-header">
                     <div>
                         <span class="settings-kicker">"System"</span>
@@ -2111,7 +3110,7 @@ fn SettingsView(
                             <option value="跟随系统">"跟随系统"</option>
                         </select>
                     </label>
-                    <div class="setting-field wide download-setting">
+<div class="setting-field wide download-setting">
                         <span>"下载位置"</span>
                         <div class="download-path-row">
                             <div class="download-path-display" title=move || download_path.get()>{move || download_path.get()}</div>
@@ -2123,6 +3122,139 @@ fn SettingsView(
                         </div>
                     </div>
                 </div>
+                <Show when=move || theme_settings.get().mode == ThemeMode::Custom>
+                    <div class="custom-theme-panel">
+                        <div class="settings-subhead">
+                            <strong>"自定义主题"</strong>
+                            <small>"修改后即时预览，右下角可恢复默认"</small>
+                        </div>
+                        <div class="custom-theme-grid">
+                            <label class="setting-field color-field">
+                                <span>"文本颜色"</span>
+                                <input type="color" prop:value=move || theme_settings.get().custom.text_color on:input={
+                                    let update_custom = update_custom.clone();
+                                    move |ev| {
+                                        let value = event_target_value(&ev);
+                                        update_custom(std::sync::Arc::new(move |custom| custom.text_color = value.clone()));
+                                    }
+                                } />
+                            </label>
+                            <label class="setting-field color-field">
+                                <span>"次级文本"</span>
+                                <input type="color" prop:value=move || theme_settings.get().custom.secondary_text_color on:input={
+                                    let update_custom = update_custom.clone();
+                                    move |ev| {
+                                        let value = event_target_value(&ev);
+                                        update_custom(std::sync::Arc::new(move |custom| custom.secondary_text_color = value.clone()));
+                                    }
+                                } />
+                            </label>
+                            <label class="setting-field color-field">
+                                <span>"背景颜色"</span>
+                                <input type="color" prop:value=move || theme_settings.get().custom.background_color on:input={
+                                    let update_custom = update_custom.clone();
+                                    move |ev| {
+                                        let value = event_target_value(&ev);
+                                        update_custom(std::sync::Arc::new(move |custom| custom.background_color = value.clone()));
+                                    }
+                                } />
+                            </label>
+                            <label class="setting-field color-field">
+                                <span>"面板颜色"</span>
+                                <input type="color" prop:value=move || theme_settings.get().custom.panel_color on:input={
+                                    let update_custom = update_custom.clone();
+                                    move |ev| {
+                                        let value = event_target_value(&ev);
+                                        update_custom(std::sync::Arc::new(move |custom| custom.panel_color = value.clone()));
+                                    }
+                                } />
+                            </label>
+                            <label class="setting-field color-field">
+                                <span>"滚动条颜色"</span>
+                                <input type="color" prop:value=move || theme_settings.get().custom.scrollbar_color on:input={
+                                    let update_custom = update_custom.clone();
+                                    move |ev| {
+                                        let value = event_target_value(&ev);
+                                        update_custom(std::sync::Arc::new(move |custom| custom.scrollbar_color = value.clone()));
+                                    }
+                                } />
+                            </label>
+                            <label class="setting-field color-field">
+                                <span>"主题色"</span>
+                                <input type="color" prop:value=move || theme_settings.get().custom.theme_color on:input={
+                                    let update_custom = update_custom.clone();
+                                    move |ev| {
+                                        let value = event_target_value(&ev);
+                                        update_custom(std::sync::Arc::new(move |custom| custom.theme_color = value.clone()));
+                                    }
+                                } />
+                            </label>
+                            <label class="setting-field color-field">
+                                <span>"按钮颜色"</span>
+                                <input type="color" prop:value=move || theme_settings.get().custom.button_color on:input={
+                                    let update_custom = update_custom.clone();
+                                    move |ev| {
+                                        let value = event_target_value(&ev);
+                                        update_custom(std::sync::Arc::new(move |custom| custom.button_color = value.clone()));
+                                    }
+                                } />
+                            </label>
+                            <label class="setting-field color-field">
+                                <span>"按钮文字"</span>
+                                <input type="color" prop:value=move || theme_settings.get().custom.button_text_color on:input={
+                                    let update_custom = update_custom.clone();
+                                    move |ev| {
+                                        let value = event_target_value(&ev);
+                                        update_custom(std::sync::Arc::new(move |custom| custom.button_text_color = value.clone()));
+                                    }
+                                } />
+                            </label>
+                            <label class="setting-field">
+                                <span>"字体大小"</span>
+                                <input class="theme-range" type="range" min="13" max="20" step="1" prop:value=move || format!("{:.0}", theme_settings.get().custom.font_size) style=move || range_fill_style(theme_settings.get().custom.font_size, 13.0, 20.0) on:input={
+                                    let update_custom = update_custom.clone();
+                                    move |ev| {
+                                        let value = event_target_value(&ev).parse::<f64>().unwrap_or(16.0);
+                                        update_custom(std::sync::Arc::new(move |custom| custom.font_size = value));
+                                    }
+                                } />
+                                <span class="setting-value">{move || format!("{:.0}px", theme_settings.get().custom.font_size)}</span>
+                            </label>
+                            <label class="setting-field">
+                                <span>"按钮圆角"</span>
+                                <input class="theme-range" type="range" min="0" max="24" step="1" prop:value=move || format!("{:.0}", theme_settings.get().custom.button_radius) style=move || range_fill_style(theme_settings.get().custom.button_radius, 0.0, 24.0) on:input={
+                                    let update_custom = update_custom.clone();
+                                    move |ev| {
+                                        let value = event_target_value(&ev).parse::<f64>().unwrap_or(8.0);
+                                        update_custom(std::sync::Arc::new(move |custom| custom.button_radius = value));
+                                    }
+                                } />
+                                <span class="setting-value">{move || format!("{:.0}px", theme_settings.get().custom.button_radius)}</span>
+                            </label>
+                            <div class="setting-field theme-image-field">
+                                <span>"自定义背景图"</span>
+                                <div class="theme-image-actions">
+                                    <button on:click=pick_theme_image>
+                                        <i class="iconfont icon-add-s"></i>
+                                        <span>"选择图片"</span>
+                                    </button>
+                                    <button on:click=clear_theme_image>
+                                        <i class="iconfont icon-guanbi"></i>
+                                        <span>"清除"</span>
+                                    </button>
+                                </div>
+                                <small>{move || {
+                                    theme_settings
+                                        .get()
+                                        .custom
+                                        .background_image
+                                        .map(|value| if value.starts_with("data:") { "已选择自定义图片".to_string() } else { value })
+                                        .unwrap_or_else(|| "未选择图片".to_string())
+                                }}</small>
+                            </div>
+                        </div>
+                    </div>
+                </Show>
                 <div class="settings-source-manager">
                     <div class="settings-subhead">
                         <strong>"音源管理"</strong>
@@ -2199,7 +3331,7 @@ fn SettingsView(
                 </div>
                 <div class="project-info-grid">
                     <div><span>"项目"</span><strong>"Miku Tunes"</strong></div>
-                    <div><span>"版本"</span><strong>"1.0.0"</strong></div>
+                    <div><span>"版本"</span><strong>"2.0.0"</strong></div>
                     <div><span>"联系"</span><strong>"GitHub Issues"</strong></div>
                     <div><span>"仓库"</span><strong>"github.com/djyasdfghjkl/rust_music"</strong></div>
                 </div>
